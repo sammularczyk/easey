@@ -1,0 +1,20 @@
+name: Auto Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: CupOfTea696/gh-action-auto-release@v1.0.2
+        with:
+          title: "v$semver"
+          tag: "v$semver"
+          changelog-entry: "[$version]"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
