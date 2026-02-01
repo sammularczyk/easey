@@ -11,3 +11,11 @@ If you're looking for a more polished value graph editor that supports Magic Eas
 
 > [!TIP]
 > Hold CTRL/CMD while dragging handles to mirror them in the Speed graph.
+
+---
+
+### Credits
+
+This script is owned and made possible by the [Canva Creative Team](https://canvacreative.team/motion). Check out more scripts at their website. 
+
+Created with the assistance of Cursor and [scenery-io/create-script](https://github.com/scenery-io/create-script).
