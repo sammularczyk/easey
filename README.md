@@ -16,6 +16,6 @@ If you're looking for a more polished value graph editor that supports Magic Eas
 
 ### Credits
 
-This script is owned and made possible by the [Canva Creative Team](https://canvacreative.team/motion). Check out more scripts at their website. 
+This script is owned and made possible by the [Canva Creative Team](https://canvacreative.team/motion). Check out more scripts, including Quiver, at their website.
 
 Created with the assistance of Cursor and [scenery-io/create-script](https://github.com/scenery-io/create-script).
