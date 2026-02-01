@@ -1,5 +1,6 @@
 node_modules
-build
+build/*
+!build/Easey.jsc
 dist
 .DS_Store
 .env
