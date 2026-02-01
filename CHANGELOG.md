@@ -15,6 +15,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 -   `Fixed` for any bug fixes
 -   `Security` in case of vulnerabilities
 
-## [1.0.0] - YYYY-MM-DD
+
+## [1.2.0] - 2026-02-01
+### Added
+- **Incoming/outgoing speed support for Speed Graph.** You can now drag the handles up!
+- **Remember last selected tab** when reopening
+- **Calculate average easing** from all selected keyframes
+- **Single keyframe support**
+- **Embedded icons** - no easey_assets folder needed.
+
+### Changed
+- Hold CMD to mirror handles on the Speed Graph 
+
+## [1.0.0] - 2025-11-05
 
 -   Initial release

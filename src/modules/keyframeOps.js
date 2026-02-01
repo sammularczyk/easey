@@ -777,7 +777,7 @@ export function copyAllKeyframeInfo() {
         var info = getKeyframeInfo();
         if (info) {
             var allText = info.propertyName + "\n" + info.startValue + " > " + info.endValue + "\n" + "cubic-bezier(" + info.easing + ")" + "\n" +
-                         "Duration: " + info.duration + "ms" + "\n";
+                         "Duration: " + info.duration + "ms (" + info.frameDuration + " frames @ " + getCompositionFrameRate() + "fps)";
             api.setClipboardText(allText);
             console.log("Copied all keyframe info to clipboard");
         }
