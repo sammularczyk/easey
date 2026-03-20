@@ -15,6 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 -   `Fixed` for any bug fixes
 -   `Security` in case of vulnerabilities
 
+## [1.3.0] - 2026-03-20
+### Added
+- **Support for motion paths!** Easey now performs correctly whether you have motion paths or not.
 
 ## [1.2.0] - 2026-02-01
 ### Added

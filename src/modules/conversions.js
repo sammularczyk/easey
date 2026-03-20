@@ -70,6 +70,53 @@ export function cavalryToCubicBezier(outHandleX, outHandleY, inHandleX, inHandle
 }
 
 /**
+ * Convert normalized cubic-bezier to Cavalry motion-path velocity (speed + influence).
+ * Maps to setKeyframeVelocity: right* = outgoing from start key, left* = incoming at end key.
+ * @param {number} x1
+ * @param {number} y1
+ * @param {number} x2
+ * @param {number} y2
+ * @returns {{ rightSpeed: number, rightInfluence: number, leftSpeed: number, leftInfluence: number }}
+ */
+export function cubicBezierToVelocity(x1, y1, x2, y2) {
+    var MIN_INFLUENCE = 0.01;
+    var MAX_INFLUENCE = 1.0;
+    var MIN_SPEED = 0.0;
+    var MAX_SPEED = 2.0;
+    var EPS = 0.0001;
+
+    var nx1 = Math.max(0, Math.min(1, x1));
+    var nx2 = Math.max(0, Math.min(1, x2));
+
+    var rightInfluence = Math.max(MIN_INFLUENCE, Math.min(MAX_INFLUENCE, nx1));
+    var leftInfluence = Math.max(MIN_INFLUENCE, Math.min(MAX_INFLUENCE, 1 - nx2));
+
+    var rightSpeed = MIN_SPEED;
+    if (Math.abs(nx1) > EPS) {
+        var rs = y1 / nx1;
+        if (isFinite(rs)) {
+            rightSpeed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, rs));
+        }
+    }
+
+    var oneMinusX2 = 1 - nx2;
+    var leftSpeed = MIN_SPEED;
+    if (Math.abs(oneMinusX2) > EPS) {
+        var ls = (1 - y2) / oneMinusX2;
+        if (isFinite(ls)) {
+            leftSpeed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, ls));
+        }
+    }
+
+    return {
+        rightSpeed: rightSpeed,
+        rightInfluence: rightInfluence,
+        leftSpeed: leftSpeed,
+        leftInfluence: leftInfluence
+    };
+}
+
+/**
  * Convert speed values to cubic-bezier
  * @param {number} outInfluence - Outgoing influence (0-100 percentage)
  * @param {number} inInfluence - Incoming influence (0-100 percentage)

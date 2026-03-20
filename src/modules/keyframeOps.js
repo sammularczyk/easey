@@ -1,7 +1,191 @@
 // Keyframe operations module
 // Functions for extracting and applying easing to keyframes
 
-import { cubicBezierToCavalry, cavalryToCubicBezier, getCompositionFrameRate, framesToMilliseconds } from './conversions.js';
+import { cubicBezierToCavalry, cavalryToCubicBezier, cubicBezierToVelocity, getCompositionFrameRate, framesToMilliseconds } from './conversions.js';
+
+var DEFAULT_LEFT_SPEED = 0.0;
+var DEFAULT_LEFT_INFLUENCE = 0.333;
+var DEFAULT_RIGHT_SPEED = 1.0;
+var DEFAULT_RIGHT_INFLUENCE = 0.333;
+
+/**
+ * Frame times on the sibling position axis (for motion path detection).
+ * @param {string} layerId
+ * @param {string} attrId
+ * @returns {Set<number>|null} null if not position.x / position.y
+ */
+function getSiblingKeyframeTimesSet(layerId, attrId) {
+    if (attrId !== 'position.x' && attrId !== 'position.y') {
+        return null;
+    }
+    var siblingAttr = attrId === 'position.x' ? 'position.y' : 'position.x';
+    try {
+        var times = api.getKeyframeTimes(layerId, siblingAttr);
+        if (!times || !Array.isArray(times)) {
+            return new Set();
+        }
+        return new Set(times);
+    } catch (e) {
+        return new Set();
+    }
+}
+
+/**
+ * True if both endpoints have keyframes on the sibling position channel (motion path segment).
+ * @param {Set<number>|null} siblingTimesSet
+ * @param {number} frameA
+ * @param {number} frameB
+ */
+function isMotionPathPair(siblingTimesSet, frameA, frameB) {
+    if (!siblingTimesSet || siblingTimesSet.size === 0) {
+        return false;
+    }
+    return siblingTimesSet.has(frameA) && siblingTimesSet.has(frameB);
+}
+
+/**
+ * Contiguous runs of keyframe indices where each consecutive pair is a motion path pair.
+ * @param {{ frames: number[] }} group
+ * @param {Set<number>} siblingTimesSet
+ * @returns {{ start: number, end: number }[]}
+ */
+function findMotionPathRuns(group, siblingTimesSet) {
+    var runs = [];
+    var runStart = null;
+    var n = group.frames.length;
+    for (var k = 0; k < n - 1; k++) {
+        var isPath = isMotionPathPair(siblingTimesSet, group.frames[k], group.frames[k + 1]);
+        if (isPath) {
+            if (runStart === null) {
+                runStart = k;
+            }
+        } else {
+            if (runStart !== null) {
+                runs.push({ start: runStart, end: k });
+                runStart = null;
+            }
+        }
+    }
+    if (runStart !== null) {
+        runs.push({ start: runStart, end: n - 1 });
+    }
+    return runs;
+}
+
+/**
+ * Unlock two keyframes for tangent editing (interpolation + handles + modifyKeyframeTangent).
+ */
+function unlockKeyframePair(keyframeIdA, keyframeIdB, frameA, frameB, attrId, layerId) {
+    var unlocked = { angleLocked: false, weightLocked: false };
+    var items = [
+        { id: keyframeIdA, frame: frameA },
+        { id: keyframeIdB, frame: frameB }
+    ];
+    for (var p = 0; p < items.length; p++) {
+        var keyframeId = items[p].id;
+        var frame = items[p].frame;
+        try {
+            var keyData = api.get(keyframeId, 'data');
+            if (keyData && keyData.interpolation !== 0) {
+                api.modifyKeyframe(keyframeId, 'interpolation', 0);
+                keyData = api.get(keyframeId, 'data');
+            }
+            if (keyData) {
+                if (!keyData.leftBez) {
+                    try {
+                        api.modifyKeyframe(keyframeId, 'leftBez.x', 0);
+                        api.modifyKeyframe(keyframeId, 'leftBez.y', 0);
+                    } catch (e) {}
+                }
+                if (!keyData.rightBez) {
+                    try {
+                        api.modifyKeyframe(keyframeId, 'rightBez.x', 0);
+                        api.modifyKeyframe(keyframeId, 'rightBez.y', 0);
+                    } catch (e) {}
+                }
+            }
+            try {
+                var unlockObj = {};
+                unlockObj[attrId] = {
+                    frame: frame,
+                    inHandle: true,
+                    outHandle: true,
+                    ...unlocked
+                };
+                api.modifyKeyframeTangent(layerId, unlockObj);
+            } catch (e) {}
+        } catch (e) {}
+    }
+}
+
+/**
+ * Apply easing via setKeyframeVelocity for a contiguous motion-path run (both position.x and position.y).
+ */
+function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEasing) {
+    var n = frames.length;
+    if (n < 2 || keyframeIds.length !== n) {
+        return;
+    }
+    var velocityByFrame = {};
+    for (var i = 0; i < n; i++) {
+        var f = frames[i];
+        var kd = api.get(keyframeIds[i], 'data');
+        velocityByFrame[f] = {
+            leftSpeed: kd && kd.leftSpeed !== undefined && kd.leftSpeed !== null ? kd.leftSpeed : DEFAULT_LEFT_SPEED,
+            leftInfluence:
+                kd && kd.leftInfluence !== undefined && kd.leftInfluence !== null
+                    ? kd.leftInfluence
+                    : DEFAULT_LEFT_INFLUENCE,
+            rightSpeed: kd && kd.rightSpeed !== undefined && kd.rightSpeed !== null ? kd.rightSpeed : DEFAULT_RIGHT_SPEED,
+            rightInfluence:
+                kd && kd.rightInfluence !== undefined && kd.rightInfluence !== null
+                    ? kd.rightInfluence
+                    : DEFAULT_RIGHT_INFLUENCE
+        };
+    }
+    for (var j = 0; j < n - 1; j++) {
+        var v = cubicBezierToVelocity(
+            currentEasing.x1,
+            currentEasing.y1,
+            currentEasing.x2,
+            currentEasing.y2
+        );
+        var f0 = frames[j];
+        var f1 = frames[j + 1];
+        velocityByFrame[f0].rightSpeed = v.rightSpeed;
+        velocityByFrame[f0].rightInfluence = v.rightInfluence;
+        velocityByFrame[f1].leftSpeed = v.leftSpeed;
+        velocityByFrame[f1].leftInfluence = v.leftInfluence;
+    }
+    for (var k = 0; k < n; k++) {
+        var fr = frames[k];
+        var vel = velocityByFrame[fr];
+        try {
+            api.setKeyframeVelocity(layerId, {
+                'position.x': {
+                    frame: fr,
+                    leftSpeed: vel.leftSpeed,
+                    rightSpeed: vel.rightSpeed,
+                    leftInfluence: vel.leftInfluence,
+                    rightInfluence: vel.rightInfluence
+                },
+                'position.y': {
+                    frame: fr,
+                    leftSpeed: vel.leftSpeed,
+                    rightSpeed: vel.rightSpeed,
+                    leftInfluence: vel.leftInfluence,
+                    rightInfluence: vel.rightInfluence
+                }
+            });
+        } catch (e) {
+            console.log('Error setKeyframeVelocity at frame ' + fr + ':', e.message);
+        }
+    }
+}
+
+function velocityRunKey(layerId, frame) {
+    return layerId + '|' + frame;
+}
 
 /**
  * Ensure keyframes are set to bezier interpolation and unlock tangents
@@ -93,55 +277,6 @@ function applyEasingToKeyframePair(currentKeyId, nextKeyId, currentKeyData, next
     } catch (error) {
         console.log("Error applying easing to keyframe pair:", error.message);
         return false;
-    }
-}
-
-/**
- * Unlock all keyframes in a group
- */
-function unlockAllKeyframes(keyframeIds, attrId, layerId, selectedFrames) {
-    var unlocked = { angleLocked: false, weightLocked: false };
-    
-    for (var i = 0; i < keyframeIds.length; i++) {
-        var keyframeId = keyframeIds[i];
-        var frame = selectedFrames[i];
-        
-        try {
-            var keyData = api.get(keyframeId, 'data');
-            
-            if (keyData && keyData.interpolation !== 0) {
-                api.modifyKeyframe(keyframeId, 'interpolation', 0);
-                keyData = api.get(keyframeId, 'data');
-            }
-            
-            if (keyData) {
-                if (!keyData.leftBez) {
-                    try {
-                        api.modifyKeyframe(keyframeId, 'leftBez.x', 0);
-                        api.modifyKeyframe(keyframeId, 'leftBez.y', 0);
-                    } catch (e) {}
-                }
-                
-                if (!keyData.rightBez) {
-                    try {
-                        api.modifyKeyframe(keyframeId, 'rightBez.x', 0);
-                        api.modifyKeyframe(keyframeId, 'rightBez.y', 0);
-                    } catch (e) {}
-                }
-            }
-            
-            try {
-                var unlockObj = {};
-                unlockObj[attrId] = {
-                    frame: frame,
-                    inHandle: true,
-                    outHandle: true,
-                    ...unlocked
-                };
-                api.modifyKeyframeTangent(layerId, unlockObj);
-            } catch (e) {}
-            
-        } catch (e) {}
     }
 }
 
@@ -507,42 +642,108 @@ export function applyEasingToKeyframes(currentEasing) {
         
         var totalProcessed = 0;
         var currentFrameTime = api.getFrame();
-        
+        var velocityApplied = new Set();
+
+        // Pass 1: motion path segments use setKeyframeVelocity (both axes); avoids modifyKeyframeTangent on paths
         for (let [attributePath, group] of Object.entries(attributeGroups)) {
             try {
-                unlockAllKeyframes(group.keyframeIds, group.attrId, group.layerId, group.frames);
-                
+                var isPositionAttr = group.attrId === 'position.x' || group.attrId === 'position.y';
+                if (!isPositionAttr) {
+                    continue;
+                }
+                var siblingSetForVelocity = getSiblingKeyframeTimesSet(group.layerId, group.attrId);
+                if (!siblingSetForVelocity) {
+                    continue;
+                }
+                var motionRuns = findMotionPathRuns(group, siblingSetForVelocity);
+                for (var r = 0; r < motionRuns.length; r++) {
+                    var runStart = motionRuns[r].start;
+                    var runEnd = motionRuns[r].end;
+                    var skipRun = true;
+                    for (var fi = runStart; fi <= runEnd; fi++) {
+                        if (!velocityApplied.has(velocityRunKey(group.layerId, group.frames[fi]))) {
+                            skipRun = false;
+                            break;
+                        }
+                    }
+                    if (skipRun) {
+                        continue;
+                    }
+                    var idsSlice = group.keyframeIds.slice(runStart, runEnd + 1);
+                    var framesSlice = group.frames.slice(runStart, runEnd + 1);
+                    applyVelocityToMotionPathGroup(group.layerId, idsSlice, framesSlice, currentEasing);
+                    for (var fj = runStart; fj <= runEnd; fj++) {
+                        velocityApplied.add(velocityRunKey(group.layerId, group.frames[fj]));
+                    }
+                }
+            } catch (velocityGroupError) {
+                console.log('Error applying motion path velocity for ' + attributePath + ':', velocityGroupError.message);
+            }
+        }
+
+        // Pass 2: standard tangent easing per pair (skip pairs that are motion path segments)
+        for (let [attributePath, group] of Object.entries(attributeGroups)) {
+            try {
+                var siblingSetForTangent = getSiblingKeyframeTimesSet(group.layerId, group.attrId);
+
                 for (var i = 0; i < group.keyframeIds.length - 1; i++) {
                     var currentKeyId = group.keyframeIds[i];
                     var nextKeyId = group.keyframeIds[i + 1];
-                    
+
                     var currentFrame = group.frames[i];
                     var nextFrame = group.frames[i + 1];
                     var frameDiff = nextFrame - currentFrame;
-                    
+
+                    if (siblingSetForTangent && isMotionPathPair(siblingSetForTangent, currentFrame, nextFrame)) {
+                        continue;
+                    }
+
+                    unlockKeyframePair(
+                        currentKeyId,
+                        nextKeyId,
+                        currentFrame,
+                        nextFrame,
+                        group.attrId,
+                        group.layerId
+                    );
+
                     api.setFrame(currentFrame);
                     var currentValue = api.get(group.layerId, group.attrId);
                     api.setFrame(nextFrame);
                     var nextValue = api.get(group.layerId, group.attrId);
-                    
+
                     var valueDiff = nextValue - currentValue;
-                    
+
                     var cavalryHandles = cubicBezierToCavalry(
-                        currentEasing.x1, currentEasing.y1, 
-                        currentEasing.x2, currentEasing.y2, 
-                        frameDiff, valueDiff
+                        currentEasing.x1,
+                        currentEasing.y1,
+                        currentEasing.x2,
+                        currentEasing.y2,
+                        frameDiff,
+                        valueDiff
                     );
-                    
+
                     var currentKeyData = api.get(currentKeyId, 'data');
                     var nextKeyData = api.get(nextKeyId, 'data');
-                    
-                    applyEasingToKeyframePair(currentKeyId, nextKeyId, currentKeyData, nextKeyData, cavalryHandles, group.attrId, group.layerId, currentFrame, currentValue, nextFrame, nextValue);
-                    
+
+                    applyEasingToKeyframePair(
+                        currentKeyId,
+                        nextKeyId,
+                        currentKeyData,
+                        nextKeyData,
+                        cavalryHandles,
+                        group.attrId,
+                        group.layerId,
+                        currentFrame,
+                        currentValue,
+                        nextFrame,
+                        nextValue
+                    );
+
                     totalProcessed++;
                 }
-                
             } catch (groupError) {
-                console.log("Error processing attribute " + attributePath + ":", groupError.message);
+                console.log('Error processing attribute ' + attributePath + ':', groupError.message);
             }
         }
         

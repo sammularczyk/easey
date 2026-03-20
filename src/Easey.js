@@ -81,7 +81,7 @@ ui.setTitle("Easey");
 // Version info
 var GITHUB_REPO = "sammularczyk/Easey";
 var scriptName = "Easey";
-var currentVersion = "1.2.0";
+var currentVersion = "1.3.0";
 
 // Check for updates
 checkForUpdate(GITHUB_REPO, scriptName, currentVersion);
