@@ -243,6 +243,36 @@ export function loadApplyOnDragSetting() {
 }
 
 /**
+ * Save clamp identical values setting
+ * @param {boolean} enabled - Whether clamping is enabled
+ */
+export function saveClampIdenticalSetting(enabled) {
+    try {
+        api.setPreferenceObject("easey_clampIdenticalValues", enabled);
+    } catch (e) {
+        console.log("Could not save clamp identical setting:", e.message);
+    }
+}
+
+/**
+ * Load clamp identical values setting
+ * @returns {boolean} Whether clamping is enabled (default: true)
+ */
+export function loadClampIdenticalSetting() {
+    try {
+        if (api.hasPreferenceObject("easey_clampIdenticalValues")) {
+            var saved = api.getPreferenceObject("easey_clampIdenticalValues");
+            if (saved !== null && saved !== undefined) {
+                return saved;
+            }
+        }
+    } catch (e) {
+        console.log("Could not load clamp identical setting:", e.message);
+    }
+    return true;
+}
+
+/**
  * Save last selected tab to preferences
  * @param {number} tabIndex - Index of the selected tab
  */

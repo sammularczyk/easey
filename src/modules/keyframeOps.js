@@ -7,6 +7,20 @@ var DEFAULT_LEFT_SPEED = 0.0;
 var DEFAULT_LEFT_INFLUENCE = 0.333;
 var DEFAULT_RIGHT_SPEED = 1.0;
 var DEFAULT_RIGHT_INFLUENCE = 0.333;
+var IDENTICAL_VALUE_EPSILON = 0.001;
+
+var _clampHoldsEnabled = true;
+
+/**
+ * Set whether identical-value clamping is active (called from Easey.js when preference changes).
+ */
+export function setClampHoldsEnabled(enabled) {
+    _clampHoldsEnabled = enabled;
+}
+
+function valuesAreIdentical(a, b) {
+    return Math.abs(a - b) < IDENTICAL_VALUE_EPSILON;
+}
 
 /**
  * Frame times on the sibling position axis (for motion path detection).
@@ -126,6 +140,17 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
     if (n < 2 || keyframeIds.length !== n) {
         return;
     }
+
+    var valuesX = [];
+    var valuesY = [];
+    var savedFrame = api.getFrame();
+    for (var vi = 0; vi < n; vi++) {
+        api.setFrame(frames[vi]);
+        valuesX.push(api.get(layerId, 'position.x'));
+        valuesY.push(api.get(layerId, 'position.y'));
+    }
+    api.setFrame(savedFrame);
+
     var velocityByFrame = {};
     for (var i = 0; i < n; i++) {
         var f = frames[i];
@@ -144,18 +169,31 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
         };
     }
     for (var j = 0; j < n - 1; j++) {
-        var v = cubicBezierToVelocity(
-            currentEasing.x1,
-            currentEasing.y1,
-            currentEasing.x2,
-            currentEasing.y2
-        );
         var f0 = frames[j];
         var f1 = frames[j + 1];
-        velocityByFrame[f0].rightSpeed = v.rightSpeed;
-        velocityByFrame[f0].rightInfluence = v.rightInfluence;
-        velocityByFrame[f1].leftSpeed = v.leftSpeed;
-        velocityByFrame[f1].leftInfluence = v.leftInfluence;
+        var isHold = _clampHoldsEnabled &&
+            valuesAreIdentical(valuesX[j], valuesX[j + 1]) &&
+            valuesAreIdentical(valuesY[j], valuesY[j + 1]);
+
+        if (isHold) {
+            velocityByFrame[f0].rightSpeed = 0;
+            velocityByFrame[f0].rightInfluence = DEFAULT_RIGHT_INFLUENCE;
+            velocityByFrame[f1].leftSpeed = 0;
+            velocityByFrame[f1].leftInfluence = DEFAULT_LEFT_INFLUENCE;
+            flattenHandlesBetweenPair(layerId, 'position.x', f0, f1);
+            flattenHandlesBetweenPair(layerId, 'position.y', f0, f1);
+        } else {
+            var v = cubicBezierToVelocity(
+                currentEasing.x1,
+                currentEasing.y1,
+                currentEasing.x2,
+                currentEasing.y2
+            );
+            velocityByFrame[f0].rightSpeed = v.rightSpeed;
+            velocityByFrame[f0].rightInfluence = v.rightInfluence;
+            velocityByFrame[f1].leftSpeed = v.leftSpeed;
+            velocityByFrame[f1].leftInfluence = v.leftInfluence;
+        }
     }
     for (var k = 0; k < n; k++) {
         var fr = frames[k];
@@ -218,6 +256,36 @@ function ensureBezierInterpolation(keyframeId, attrId, layerId, frame) {
         console.log("Error ensuring bezier interpolation:", error.message);
         return false;
     }
+}
+
+/**
+ * Zero out the tangent handles between two keyframes (outgoing of first, incoming of second).
+ * Uses angle=0, weight=0 to flatten without disturbing the other side's easing.
+ */
+function flattenHandlesBetweenPair(layerId, attrId, frameA, frameB) {
+    var unlocked = { angleLocked: false, weightLocked: false };
+    try {
+        var outObj = {};
+        outObj[attrId] = {
+            frame: frameA,
+            outHandle: true,
+            angle: 0,
+            weight: 0,
+            ...unlocked
+        };
+        api.modifyKeyframeTangent(layerId, outObj);
+    } catch (e) {}
+    try {
+        var inObj = {};
+        inObj[attrId] = {
+            frame: frameB,
+            inHandle: true,
+            angle: 0,
+            weight: 0,
+            ...unlocked
+        };
+        api.modifyKeyframeTangent(layerId, inObj);
+    } catch (e) {}
 }
 
 /**
@@ -712,6 +780,12 @@ export function applyEasingToKeyframes(currentEasing) {
                     api.setFrame(nextFrame);
                     var nextValue = api.get(group.layerId, group.attrId);
 
+                    if (_clampHoldsEnabled && valuesAreIdentical(currentValue, nextValue)) {
+                        flattenHandlesBetweenPair(group.layerId, group.attrId, currentFrame, nextFrame);
+                        totalProcessed++;
+                        continue;
+                    }
+
                     var valueDiff = nextValue - currentValue;
 
                     var cavalryHandles = cubicBezierToCavalry(
@@ -752,6 +826,123 @@ export function applyEasingToKeyframes(currentEasing) {
         
     } catch (error) {
         console.log("Error applying easing to keyframes:", error.message);
+        return false;
+    }
+}
+
+/**
+ * Standalone command: flatten motion path handles between consecutive keyframes with identical values.
+ * Works on any selected keyframes regardless of the clamp preference setting.
+ * @returns {boolean} Success status
+ */
+export function fixHoldPaths() {
+    try {
+        var selectedKeyframes = api.getSelectedKeyframes();
+        var keyframeIds = api.getSelectedKeyframeIds();
+
+        if (keyframeIds.length < 2) {
+            console.log("Fix Holds: Select at least 2 keyframes");
+            return false;
+        }
+
+        var attributeGroups = {};
+        for (let [fullAttributePath, frames] of Object.entries(selectedKeyframes)) {
+            if (frames.length < 2) continue;
+            var hashIndex = fullAttributePath.indexOf('#');
+            if (hashIndex === -1) continue;
+            var dotAfterHash = fullAttributePath.indexOf('.', hashIndex);
+            if (dotAfterHash === -1) continue;
+
+            var layerId = fullAttributePath.substring(0, dotAfterHash);
+            var attrId = fullAttributePath.substring(dotAfterHash + 1);
+
+            var attributeKeyframeIds = [];
+            for (var i = 0; i < keyframeIds.length; i++) {
+                if (api.getAttributeFromKeyframeId(keyframeIds[i]) === fullAttributePath) {
+                    attributeKeyframeIds.push(keyframeIds[i]);
+                }
+            }
+            if (attributeKeyframeIds.length >= 2) {
+                attributeGroups[fullAttributePath] = {
+                    layerId: layerId,
+                    attrId: attrId,
+                    frames: frames.sort(function (a, b) { return a - b; }),
+                    keyframeIds: attributeKeyframeIds
+                };
+            }
+        }
+
+        var fixedCount = 0;
+        var savedFrame = api.getFrame();
+        var velocityFixed = new Set();
+
+        for (let [attributePath, group] of Object.entries(attributeGroups)) {
+            var siblingTimes = getSiblingKeyframeTimesSet(group.layerId, group.attrId);
+
+            for (var j = 0; j < group.frames.length - 1; j++) {
+                var frameA = group.frames[j];
+                var frameB = group.frames[j + 1];
+
+                api.setFrame(frameA);
+                var valA = api.get(group.layerId, group.attrId);
+                api.setFrame(frameB);
+                var valB = api.get(group.layerId, group.attrId);
+
+                if (!valuesAreIdentical(valA, valB)) {
+                    continue;
+                }
+
+                var isPath = siblingTimes && isMotionPathPair(siblingTimes, frameA, frameB);
+
+                if (isPath) {
+                    var siblingAttr = group.attrId === 'position.x' ? 'position.y' : 'position.x';
+                    api.setFrame(frameA);
+                    var sibValA = api.get(group.layerId, siblingAttr);
+                    api.setFrame(frameB);
+                    var sibValB = api.get(group.layerId, siblingAttr);
+
+                    if (!valuesAreIdentical(sibValA, sibValB)) {
+                        continue;
+                    }
+
+                    var keyA = velocityRunKey(group.layerId, frameA);
+                    var keyB = velocityRunKey(group.layerId, frameB);
+                    if (!velocityFixed.has(keyA) || !velocityFixed.has(keyB)) {
+                        flattenHandlesBetweenPair(group.layerId, 'position.x', frameA, frameB);
+                        flattenHandlesBetweenPair(group.layerId, 'position.y', frameA, frameB);
+                        try {
+                            api.setKeyframeVelocity(group.layerId, {
+                                'position.x': { frame: frameA, rightSpeed: 0, rightInfluence: DEFAULT_RIGHT_INFLUENCE, leftSpeed: DEFAULT_LEFT_SPEED, leftInfluence: DEFAULT_LEFT_INFLUENCE },
+                                'position.y': { frame: frameA, rightSpeed: 0, rightInfluence: DEFAULT_RIGHT_INFLUENCE, leftSpeed: DEFAULT_LEFT_SPEED, leftInfluence: DEFAULT_LEFT_INFLUENCE }
+                            });
+                        } catch (e) {}
+                        try {
+                            api.setKeyframeVelocity(group.layerId, {
+                                'position.x': { frame: frameB, leftSpeed: 0, leftInfluence: DEFAULT_LEFT_INFLUENCE, rightSpeed: DEFAULT_RIGHT_SPEED, rightInfluence: DEFAULT_RIGHT_INFLUENCE },
+                                'position.y': { frame: frameB, leftSpeed: 0, leftInfluence: DEFAULT_LEFT_INFLUENCE, rightSpeed: DEFAULT_RIGHT_SPEED, rightInfluence: DEFAULT_RIGHT_INFLUENCE }
+                            });
+                        } catch (e) {}
+                        velocityFixed.add(keyA);
+                        velocityFixed.add(keyB);
+                        fixedCount++;
+                    }
+                } else {
+                    flattenHandlesBetweenPair(group.layerId, group.attrId, frameA, frameB);
+                    fixedCount++;
+                }
+            }
+        }
+
+        api.setFrame(savedFrame);
+
+        if (fixedCount > 0) {
+            console.log("Fixed " + fixedCount + " hold segment(s)");
+        } else {
+            console.log("No identical-value pairs found to fix");
+        }
+        return true;
+    } catch (error) {
+        console.log("Fix holds error:", error.message);
         return false;
     }
 }

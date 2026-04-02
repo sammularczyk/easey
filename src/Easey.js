@@ -63,11 +63,13 @@ import { checkForUpdate } from './modules/updateChecker.js';
 import { getCompositionFrameRate } from './modules/conversions.js';
 import { drawCurve, drawSpeedCurve } from './modules/graphRenderer.js';
 import { setupValueGraphHandlers, setupSpeedGraphHandlers } from './modules/mouseHandlers.js';
-import { getEasingFromKeyframes, applyEasingToKeyframes, copyKeyframeDuration, copyKeyframeValues, copyAllKeyframeInfo } from './modules/keyframeOps.js';
+import { getEasingFromKeyframes, applyEasingToKeyframes, fixHoldPaths, setClampHoldsEnabled, copyKeyframeDuration, copyKeyframeValues, copyAllKeyframeInfo } from './modules/keyframeOps.js';
 import { 
     savePreset, renamePreset, deletePreset, deleteAllPresets,
     exportPresets, importPresets, savePresetsToPreferences, loadPresetsFromPreferences,
-    saveApplyOnDragSetting, loadApplyOnDragSetting, saveLastSelectedTab, loadLastSelectedTab,
+    saveApplyOnDragSetting, loadApplyOnDragSetting,
+    saveClampIdenticalSetting, loadClampIdenticalSetting,
+    saveLastSelectedTab, loadLastSelectedTab,
     populatePresetDropdown, copyCubicBezierToClipboard
 } from './modules/presetManager.js';
 import { initializeAssets, getAssetPath } from './modules/embeddedAssets.js';
@@ -81,7 +83,7 @@ ui.setTitle("Easey");
 // Version info
 var GITHUB_REPO = "sammularczyk/Easey";
 var scriptName = "Easey";
-var currentVersion = "1.3.0";
+var currentVersion = "1.4.0";
 
 // Check for updates
 checkForUpdate(GITHUB_REPO, scriptName, currentVersion);
@@ -124,6 +126,7 @@ var speedDragHandle = null;
 
 // Settings
 var applyOnDragEnabled = false;
+var clampHoldsEnabled = true;
 
 // Flags
 var isUpdatingFromPreset = false;
@@ -417,6 +420,24 @@ function showPresetContextMenu() {
         }
     });
 
+    ui.addMenuItem({
+        name: "Automatically clamp paths" + (clampHoldsEnabled ? " ✓" : ""),
+        onMouseRelease: function() {
+            clampHoldsEnabled = !clampHoldsEnabled;
+            setClampHoldsEnabled(clampHoldsEnabled);
+            saveClampIdenticalSetting(clampHoldsEnabled);
+        }
+    });
+
+    ui.addMenuItem(separatorItem);
+
+    ui.addMenuItem({
+        name: "Clamp motion paths between holds",
+        onMouseRelease: function() {
+            fixHoldPaths();
+        }
+    });
+
     ui.addMenuItem(separatorItem);
 
     ui.addMenuItem({
@@ -504,6 +525,10 @@ loadPresetsFromPreferences(presets);
 
 // Load apply on drag setting
 applyOnDragEnabled = loadApplyOnDragSetting();
+
+// Load clamp holds setting
+clampHoldsEnabled = loadClampIdenticalSetting();
+setClampHoldsEnabled(clampHoldsEnabled);
 
 // Populate preset dropdown
 populatePresetDropdown(presetList, presets);
