@@ -910,16 +910,46 @@ export function fixHoldPaths() {
                     if (!velocityFixed.has(keyA) || !velocityFixed.has(keyB)) {
                         flattenHandlesBetweenPair(group.layerId, 'position.x', frameA, frameB);
                         flattenHandlesBetweenPair(group.layerId, 'position.y', frameA, frameB);
+
+                        var kfIdA = group.keyframeIds[j];
+                        var kfIdB = group.keyframeIds[j + 1];
+                        var kdA = api.get(kfIdA, 'data') || {};
+                        var kdB = api.get(kfIdB, 'data') || {};
+
                         try {
                             api.setKeyframeVelocity(group.layerId, {
-                                'position.x': { frame: frameA, rightSpeed: 0, rightInfluence: DEFAULT_RIGHT_INFLUENCE, leftSpeed: DEFAULT_LEFT_SPEED, leftInfluence: DEFAULT_LEFT_INFLUENCE },
-                                'position.y': { frame: frameA, rightSpeed: 0, rightInfluence: DEFAULT_RIGHT_INFLUENCE, leftSpeed: DEFAULT_LEFT_SPEED, leftInfluence: DEFAULT_LEFT_INFLUENCE }
+                                'position.x': {
+                                    frame: frameA,
+                                    leftSpeed: kdA.leftSpeed !== undefined ? kdA.leftSpeed : DEFAULT_LEFT_SPEED,
+                                    leftInfluence: kdA.leftInfluence !== undefined ? kdA.leftInfluence : DEFAULT_LEFT_INFLUENCE,
+                                    rightSpeed: 0,
+                                    rightInfluence: DEFAULT_RIGHT_INFLUENCE
+                                },
+                                'position.y': {
+                                    frame: frameA,
+                                    leftSpeed: kdA.leftSpeed !== undefined ? kdA.leftSpeed : DEFAULT_LEFT_SPEED,
+                                    leftInfluence: kdA.leftInfluence !== undefined ? kdA.leftInfluence : DEFAULT_LEFT_INFLUENCE,
+                                    rightSpeed: 0,
+                                    rightInfluence: DEFAULT_RIGHT_INFLUENCE
+                                }
                             });
                         } catch (e) {}
                         try {
                             api.setKeyframeVelocity(group.layerId, {
-                                'position.x': { frame: frameB, leftSpeed: 0, leftInfluence: DEFAULT_LEFT_INFLUENCE, rightSpeed: DEFAULT_RIGHT_SPEED, rightInfluence: DEFAULT_RIGHT_INFLUENCE },
-                                'position.y': { frame: frameB, leftSpeed: 0, leftInfluence: DEFAULT_LEFT_INFLUENCE, rightSpeed: DEFAULT_RIGHT_SPEED, rightInfluence: DEFAULT_RIGHT_INFLUENCE }
+                                'position.x': {
+                                    frame: frameB,
+                                    leftSpeed: 0,
+                                    leftInfluence: DEFAULT_LEFT_INFLUENCE,
+                                    rightSpeed: kdB.rightSpeed !== undefined ? kdB.rightSpeed : DEFAULT_RIGHT_SPEED,
+                                    rightInfluence: kdB.rightInfluence !== undefined ? kdB.rightInfluence : DEFAULT_RIGHT_INFLUENCE
+                                },
+                                'position.y': {
+                                    frame: frameB,
+                                    leftSpeed: 0,
+                                    leftInfluence: DEFAULT_LEFT_INFLUENCE,
+                                    rightSpeed: kdB.rightSpeed !== undefined ? kdB.rightSpeed : DEFAULT_RIGHT_SPEED,
+                                    rightInfluence: kdB.rightInfluence !== undefined ? kdB.rightInfluence : DEFAULT_RIGHT_INFLUENCE
+                                }
                             });
                         } catch (e) {}
                         velocityFixed.add(keyA);
