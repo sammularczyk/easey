@@ -15,6 +15,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 -   `Fixed` for any bug fixes
 -   `Security` in case of vulnerabilities
 
+## [1.4.1] - 2026-04-02
+### Added
+- **Motion paths: automatically remove overshoot between keyframes of the same value!** Just apply easing to multiple keyframes or go to Settings to fix any annoying overshoots.
+
+### Fixed
+- Clamp function now preserves easing.
+
 ## [1.4.0] - 2026-03-20
 ### Added
 - **Motion paths: automatically remove overshoot between keyframes of the same value!** Just apply easing to multiple keyframes or go to Settings to fix any annoying overshoots.
