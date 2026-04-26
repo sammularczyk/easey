@@ -1,7 +1,7 @@
 # Easey
 ### Open source speed and value graph for Cavalry
 
-<p align="center" style="margin-top:0;margin-bottom:0;">
+<p align="left" style="margin-top:0;margin-bottom:0;">
   <a href="https://github.com/sammularczyk/Easey/releases/latest/download/Easey.jsc">
     <img width="186" height="58px" alt="quiver_download" src="https://github.com/user-attachments/assets/9295a646-c7ba-4649-b069-2e78204dc1ce" />
   </a>
