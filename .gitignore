@@ -1,6 +1,26 @@
-node_modules
-build/*
-!build/Easey.jsc
-dist
+# Dependencies
+node_modules/
+
+# Build outputs
+build/
+dist/
+
+# OS
 .DS_Store
+
+# Env
 .env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+.prettierrc.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# Packages
+*.tgz
