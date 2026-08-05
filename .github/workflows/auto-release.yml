@@ -20,6 +20,7 @@ jobs:
         with:
           title: "v$semver"
           tag: "v$semver"
+          changelog: "dev/CHANGELOG.md"
           changelog-entry: "[$version]"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -31,6 +32,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.auto-release.outputs.upload_url }}
-          asset_path: ./build/Easey.jsc
+          asset_path: ./Easey.jsc
           asset_name: Easey.jsc
           asset_content_type: application/javascript
