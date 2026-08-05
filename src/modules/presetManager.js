@@ -243,6 +243,36 @@ export function loadApplyOnDragSetting() {
 }
 
 /**
+ * Save automatic update check setting
+ * @param {boolean} enabled - Whether the update check runs on launch
+ */
+export function saveUpdateCheckSetting(enabled) {
+    try {
+        api.setPreferenceObject("easey_checkForUpdates", enabled);
+    } catch (e) {
+        console.log("Could not save update check setting:", e.message);
+    }
+}
+
+/**
+ * Load automatic update check setting
+ * @returns {boolean} Whether the update check runs on launch (default: true)
+ */
+export function loadUpdateCheckSetting() {
+    try {
+        if (api.hasPreferenceObject("easey_checkForUpdates")) {
+            var saved = api.getPreferenceObject("easey_checkForUpdates");
+            if (saved !== null && saved !== undefined) {
+                return saved;
+            }
+        }
+    } catch (e) {
+        console.log("Could not load update check setting:", e.message);
+    }
+    return true;
+}
+
+/**
  * Save clamp identical values setting
  * @param {boolean} enabled - Whether clamping is enabled
  */

@@ -16,12 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 -   `Security` in case of vulnerabilities
 
 
-## [1.4.1] - 2026-04-02
+## [1.5.0] - 2026-08-05
 ### Added
-- **Motion paths: automatically remove overshoot between keyframes of the same value!** Just apply easing to multiple keyframes or go to Settings to fix any annoying overshoots.
-
-### Fixed
-- Clamp function now preserves easing.
+- **Straight motion path segments now use tangent easing**. Useful when a shape has to stay pinned to a corner of something that is scaling.
+- The automatic update check can now be disabled.
 
 ## [1.4.0] - 2026-03-20
 ### Added

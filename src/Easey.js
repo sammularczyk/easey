@@ -69,6 +69,7 @@ import {
     exportPresets, importPresets, savePresetsToPreferences, loadPresetsFromPreferences,
     saveApplyOnDragSetting, loadApplyOnDragSetting,
     saveClampIdenticalSetting, loadClampIdenticalSetting,
+    saveUpdateCheckSetting, loadUpdateCheckSetting,
     saveLastSelectedTab, loadLastSelectedTab,
     populatePresetDropdown, copyCubicBezierToClipboard
 } from './modules/presetManager.js';
@@ -85,8 +86,11 @@ var GITHUB_REPO = "sammularczyk/Easey";
 var scriptName = "Easey";
 var currentVersion = "1.5.0";
 
-// Check for updates
-checkForUpdate(GITHUB_REPO, scriptName, currentVersion);
+// Check for updates (unless the user turned it off)
+var updateCheckEnabled = loadUpdateCheckSetting();
+if (updateCheckEnabled) {
+    checkForUpdate(GITHUB_REPO, scriptName, currentVersion);
+}
 
 // ============================================================================
 // STATE
@@ -426,6 +430,14 @@ function showPresetContextMenu() {
             clampHoldsEnabled = !clampHoldsEnabled;
             setClampHoldsEnabled(clampHoldsEnabled);
             saveClampIdenticalSetting(clampHoldsEnabled);
+        }
+    });
+
+    ui.addMenuItem({
+        name: "Check for updates automatically" + (updateCheckEnabled ? " ✓" : ""),
+        onMouseRelease: function() {
+            updateCheckEnabled = !updateCheckEnabled;
+            saveUpdateCheckSetting(updateCheckEnabled);
         }
     });
 

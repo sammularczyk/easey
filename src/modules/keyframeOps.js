@@ -132,63 +132,37 @@ function unlockKeyframePair(keyframeIdA, keyframeIdB, frameA, frameB, attrId, la
     }
 }
 
-var STRAIGHT_PATH_EPSILON = 0.01;
 var TANGENT_MODE_SPEED = 1.0;
+var STRAIGHT_PATH_TOLERANCE_FRACTION = 0.005;   // 0.5% of the segment's chord length
+var STRAIGHT_PATH_TOLERANCE_MIN = 0.5;          // units, floor for very short moves
+var STRAIGHT_PATH_SAMPLES = 9;
 
 /**
- * Keyframe data for an attribute, indexed by frame.
+ * True when a motion path segment is straight enough to treat as a straight line, so tangent
+ * easing can be used instead of velocity easing. Measures the actual path: the largest
+ * perpendicular distance from the chord, sampled across the segment. A visually straight
+ * segment with slightly nudged handles passes, and applying tangent easing then straightens
+ * it exactly — which is the point, it matches a single-value Attribute's easing precisely.
  */
-function keyDataByFrame(layerId, attrId) {
-    var byFrame = {};
-    try {
-        var times = api.getKeyframeTimes(layerId, attrId) || [];
-        var ids = api.getKeyframeIdsForAttribute(layerId, attrId) || [];
-        for (var i = 0; i < times.length; i++) {
-            if (ids[i]) {
-                byFrame[times[i]] = api.get(ids[i], 'data') || {};
-            }
-        }
-    } catch (e) {}
-    return byFrame;
-}
-
-/**
- * Normalised cubic-bezier for one axis of one segment, or null if the handles are missing.
- * A degenerate axis (no value change) only stays on the chord if its handles are flat.
- */
-function normalisedSegment(dataA, dataB, frameDiff, valueDiff) {
-    if (!dataA || !dataB || frameDiff === 0) {
-        return null;
-    }
-    // An untouched keyframe reports no handle at all — that is a flat handle, not a curve.
-    var outHandle = dataA.rightBez || { x: 0, y: 0 };
-    var inHandle = dataB.leftBez || { x: 0, y: 0 };
-    if (Math.abs(valueDiff) < IDENTICAL_VALUE_EPSILON) {
-        var flat = Math.abs(outHandle.y) < IDENTICAL_VALUE_EPSILON && Math.abs(inHandle.y) < IDENTICAL_VALUE_EPSILON;
-        return flat ? { degenerate: true } : null;
-    }
-    var bezier = cavalryToCubicBezier(outHandle.x, outHandle.y, inHandle.x, inHandle.y, frameDiff, valueDiff);
-    bezier.degenerate = false;
-    return bezier;
-}
-
-/**
- * True when a motion path segment is a straight line, so tangent easing can be used instead
- * of velocity easing. The path only stays on the chord while both axes share the same
- * normalised timing curve — any difference in x1/y1/x2/y2 between the axes bends it.
- */
-function segmentPathIsStraight(dataAX, dataBX, dataAY, dataBY, frameDiff, valueDiffX, valueDiffY) {
-    var cx = normalisedSegment(dataAX, dataBX, frameDiff, valueDiffX);
-    var cy = normalisedSegment(dataAY, dataBY, frameDiff, valueDiffY);
-    if (!cx || !cy) {
-        return false;
-    }
-    if (cx.degenerate || cy.degenerate) {
+function segmentPathIsStraight(layerId, frameA, frameB, valueAX, valueBX, valueAY, valueBY) {
+    var chordX = valueBX - valueAX;
+    var chordY = valueBY - valueAY;
+    var chord = Math.hypot(chordX, chordY);
+    if (chord < IDENTICAL_VALUE_EPSILON) {
         return true;
     }
-    return ['x1', 'y1', 'x2', 'y2'].every(function (k) {
-        return Math.abs(cx[k] - cy[k]) < STRAIGHT_PATH_EPSILON;
-    });
+    var tolerance = Math.max(STRAIGHT_PATH_TOLERANCE_MIN, chord * STRAIGHT_PATH_TOLERANCE_FRACTION);
+    var frameDiff = frameB - frameA;
+    var steps = Math.min(STRAIGHT_PATH_SAMPLES, Math.max(0, frameDiff - 1));
+    for (var s = 1; s <= steps; s++) {
+        api.setFrame(frameA + Math.round((frameDiff * s) / (steps + 1)));
+        var offsetX = api.get(layerId, 'position.x') - valueAX;
+        var offsetY = api.get(layerId, 'position.y') - valueAY;
+        if (Math.abs(offsetX * chordY - offsetY * chordX) / chord > tolerance) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /**
@@ -279,9 +253,6 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
                     : DEFAULT_RIGHT_INFLUENCE
         };
     }
-    var dataX = keyDataByFrame(layerId, 'position.x');
-    var dataY = keyDataByFrame(layerId, 'position.y');
-
     for (var j = 0; j < n - 1; j++) {
         var f0 = frames[j];
         var f1 = frames[j + 1];
@@ -289,10 +260,9 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
             valuesAreIdentical(valuesX[j], valuesX[j + 1]) &&
             valuesAreIdentical(valuesY[j], valuesY[j + 1]);
         var isStraight = !isHold && segmentPathIsStraight(
-            dataX[f0], dataX[f1], dataY[f0], dataY[f1],
-            f1 - f0,
-            valuesX[j + 1] - valuesX[j],
-            valuesY[j + 1] - valuesY[j]
+            layerId, f0, f1,
+            valuesX[j], valuesX[j + 1],
+            valuesY[j], valuesY[j + 1]
         );
 
         if (isStraight) {
@@ -326,6 +296,7 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
             velocityByFrame[f1].leftInfluence = v.leftInfluence;
         }
     }
+    api.setFrame(savedFrame);   // straightness sampling scrubs the timeline
     for (var k = 0; k < n; k++) {
         var fr = frames[k];
         var vel = velocityByFrame[fr];
