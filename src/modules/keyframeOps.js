@@ -90,7 +90,6 @@ function findMotionPathRuns(group, siblingTimesSet) {
  * Unlock two keyframes for tangent editing (interpolation + handles + modifyKeyframeTangent).
  */
 function unlockKeyframePair(keyframeIdA, keyframeIdB, frameA, frameB, attrId, layerId) {
-    var unlocked = { angleLocked: false, weightLocked: false };
     var items = [
         { id: keyframeIdA, frame: frameA },
         { id: keyframeIdB, frame: frameB }
@@ -124,12 +123,124 @@ function unlockKeyframePair(keyframeIdA, keyframeIdB, frameA, frameB, attrId, la
                     frame: frame,
                     inHandle: true,
                     outHandle: true,
-                    ...unlocked
+                    angleLocked: false,
+                    weightLocked: false
                 };
                 api.modifyKeyframeTangent(layerId, unlockObj);
             } catch (e) {}
         } catch (e) {}
     }
+}
+
+var STRAIGHT_PATH_EPSILON = 0.01;
+var TANGENT_MODE_SPEED = 1.0;
+
+/**
+ * Keyframe data for an attribute, indexed by frame.
+ */
+function keyDataByFrame(layerId, attrId) {
+    var byFrame = {};
+    try {
+        var times = api.getKeyframeTimes(layerId, attrId) || [];
+        var ids = api.getKeyframeIdsForAttribute(layerId, attrId) || [];
+        for (var i = 0; i < times.length; i++) {
+            if (ids[i]) {
+                byFrame[times[i]] = api.get(ids[i], 'data') || {};
+            }
+        }
+    } catch (e) {}
+    return byFrame;
+}
+
+/**
+ * Normalised cubic-bezier for one axis of one segment, or null if the handles are missing.
+ * A degenerate axis (no value change) only stays on the chord if its handles are flat.
+ */
+function normalisedSegment(dataA, dataB, frameDiff, valueDiff) {
+    if (!dataA || !dataB || frameDiff === 0) {
+        return null;
+    }
+    // An untouched keyframe reports no handle at all — that is a flat handle, not a curve.
+    var outHandle = dataA.rightBez || { x: 0, y: 0 };
+    var inHandle = dataB.leftBez || { x: 0, y: 0 };
+    if (Math.abs(valueDiff) < IDENTICAL_VALUE_EPSILON) {
+        var flat = Math.abs(outHandle.y) < IDENTICAL_VALUE_EPSILON && Math.abs(inHandle.y) < IDENTICAL_VALUE_EPSILON;
+        return flat ? { degenerate: true } : null;
+    }
+    var bezier = cavalryToCubicBezier(outHandle.x, outHandle.y, inHandle.x, inHandle.y, frameDiff, valueDiff);
+    bezier.degenerate = false;
+    return bezier;
+}
+
+/**
+ * True when a motion path segment is a straight line, so tangent easing can be used instead
+ * of velocity easing. The path only stays on the chord while both axes share the same
+ * normalised timing curve — any difference in x1/y1/x2/y2 between the axes bends it.
+ */
+function segmentPathIsStraight(dataAX, dataBX, dataAY, dataBY, frameDiff, valueDiffX, valueDiffY) {
+    var cx = normalisedSegment(dataAX, dataBX, frameDiff, valueDiffX);
+    var cy = normalisedSegment(dataAY, dataBY, frameDiff, valueDiffY);
+    if (!cx || !cy) {
+        return false;
+    }
+    if (cx.degenerate || cy.degenerate) {
+        return true;
+    }
+    return ['x1', 'y1', 'x2', 'y2'].every(function (k) {
+        return Math.abs(cx[k] - cy[k]) < STRAIGHT_PATH_EPSILON;
+    });
+}
+
+/**
+ * Write tangent-based easing to both axes of one straight motion path segment.
+ * Cavalry only honours bezier handles on a position keyframe when that side's speed is 1
+ * and no magic easing is set — the caller must set both speeds, this clears magic easing.
+ */
+function applyTangentEasingToPathSegment(layerId, frameA, frameB, valueAX, valueBX, valueAY, valueBY, currentEasing) {
+    var frameDiff = frameB - frameA;
+    var axes = [
+        { attrId: 'position.x', valueA: valueAX, valueB: valueBX },
+        { attrId: 'position.y', valueA: valueAY, valueB: valueBY }
+    ];
+    axes.forEach(function (axis) {
+        [frameA, frameB].forEach(function (frame) {
+            try {
+                api.magicEasing(layerId, axis.attrId, frame, 'None');
+            } catch (e) {}
+        });
+        var handles = cubicBezierToCavalry(
+            currentEasing.x1,
+            currentEasing.y1,
+            currentEasing.x2,
+            currentEasing.y2,
+            frameDiff,
+            axis.valueB - axis.valueA
+        );
+        try {
+            var outObj = {};
+            outObj[axis.attrId] = {
+                frame: frameA,
+                outHandle: true,
+                xValue: frameA + handles.outHandleX,
+                yValue: axis.valueA + handles.outHandleY,
+                angleLocked: false,
+                weightLocked: false
+            };
+            api.modifyKeyframeTangent(layerId, outObj);
+            var inObj = {};
+            inObj[axis.attrId] = {
+                frame: frameB,
+                inHandle: true,
+                xValue: frameB + handles.inHandleX,
+                yValue: axis.valueB + handles.inHandleY,
+                angleLocked: false,
+                weightLocked: false
+            };
+            api.modifyKeyframeTangent(layerId, inObj);
+        } catch (e) {
+            console.log('Error applying tangent easing to path segment at frame ' + frameA + ':', e.message);
+        }
+    });
 }
 
 /**
@@ -168,14 +279,34 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
                     : DEFAULT_RIGHT_INFLUENCE
         };
     }
+    var dataX = keyDataByFrame(layerId, 'position.x');
+    var dataY = keyDataByFrame(layerId, 'position.y');
+
     for (var j = 0; j < n - 1; j++) {
         var f0 = frames[j];
         var f1 = frames[j + 1];
         var isHold = _clampHoldsEnabled &&
             valuesAreIdentical(valuesX[j], valuesX[j + 1]) &&
             valuesAreIdentical(valuesY[j], valuesY[j + 1]);
+        var isStraight = !isHold && segmentPathIsStraight(
+            dataX[f0], dataX[f1], dataY[f0], dataY[f1],
+            f1 - f0,
+            valuesX[j + 1] - valuesX[j],
+            valuesY[j + 1] - valuesY[j]
+        );
 
-        if (isHold) {
+        if (isStraight) {
+            // Straight path: tangent easing matches a cubic-bezier exactly, so single-channel
+            // attributes (scale, rotation…) eased with the same curve stay in lockstep.
+            applyTangentEasingToPathSegment(
+                layerId, f0, f1,
+                valuesX[j], valuesX[j + 1],
+                valuesY[j], valuesY[j + 1],
+                currentEasing
+            );
+            velocityByFrame[f0].rightSpeed = TANGENT_MODE_SPEED;
+            velocityByFrame[f1].leftSpeed = TANGENT_MODE_SPEED;
+        } else if (isHold) {
             velocityByFrame[f0].rightSpeed = 0;
             velocityByFrame[f0].rightInfluence = DEFAULT_RIGHT_INFLUENCE;
             velocityByFrame[f1].leftSpeed = 0;
@@ -259,12 +390,35 @@ function ensureBezierInterpolation(keyframeId, attrId, layerId, frame) {
 }
 
 /**
+ * True when a keyframe's in/out handle is already flat (zero length), or has no handle data.
+ * Cavalry keyframes cannot be unlocked from script ('locked' is not a settable attribute),
+ * and flattening a handle that is ALREADY flat makes Cavalry apply the angle to the other
+ * handle too — which wipes the neighbouring segment's spatial tangent. So don't write it.
+ */
+function handleIsFlat(layerId, attrId, frame, side) {
+    try {
+        var times = api.getKeyframeTimes(layerId, attrId);
+        var ids = api.getKeyframeIdsForAttribute(layerId, attrId);
+        var i = times.indexOf(frame);
+        if (i === -1 || !ids[i]) return false;
+        var data = api.get(ids[i], 'data') || {};
+        var handle = side === 'in' ? data.leftBez : data.rightBez;
+        if (!handle) return true;
+        return Math.abs(handle.x) < 0.001 && Math.abs(handle.y) < 0.001;
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
  * Zero out the tangent handles between two keyframes (outgoing of first, incoming of second).
  * Uses angle=0, weight=0 to flatten without disturbing the other side's easing.
+ * Already-flat handles are skipped — see handleIsFlat.
  */
 function flattenHandlesBetweenPair(layerId, attrId, frameA, frameB) {
     var unlocked = { angleLocked: false, weightLocked: false };
-    try {
+    if (!handleIsFlat(layerId, attrId, frameA, 'out')) {
+      try {
         var outObj = {};
         outObj[attrId] = {
             frame: frameA,
@@ -274,8 +428,10 @@ function flattenHandlesBetweenPair(layerId, attrId, frameA, frameB) {
             ...unlocked
         };
         api.modifyKeyframeTangent(layerId, outObj);
-    } catch (e) {}
-    try {
+      } catch (e) {}
+    }
+    if (!handleIsFlat(layerId, attrId, frameB, 'in')) {
+      try {
         var inObj = {};
         inObj[attrId] = {
             frame: frameB,
@@ -285,7 +441,8 @@ function flattenHandlesBetweenPair(layerId, attrId, frameA, frameB) {
             ...unlocked
         };
         api.modifyKeyframeTangent(layerId, inObj);
-    } catch (e) {}
+      } catch (e) {}
+    }
 }
 
 /**
@@ -908,11 +1065,12 @@ export function fixHoldPaths() {
                     var keyA = velocityRunKey(group.layerId, frameA);
                     var keyB = velocityRunKey(group.layerId, frameB);
                     if (!velocityFixed.has(keyA) || !velocityFixed.has(keyB)) {
+                        var kfIdA = group.keyframeIds[j];
+                        var kfIdB = group.keyframeIds[j + 1];
+
                         flattenHandlesBetweenPair(group.layerId, 'position.x', frameA, frameB);
                         flattenHandlesBetweenPair(group.layerId, 'position.y', frameA, frameB);
 
-                        var kfIdA = group.keyframeIds[j];
-                        var kfIdB = group.keyframeIds[j + 1];
                         var kdA = api.get(kfIdA, 'data') || {};
                         var kdB = api.get(kfIdB, 'data') || {};
 
