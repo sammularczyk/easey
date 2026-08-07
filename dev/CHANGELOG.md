@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 -   `Security` in case of vulnerabilities
 
 
+## [1.5.1] - 2026-08-07
+### Fixed
+- Applying easing to some of a layer's keyframes no longer affects surrounding keyframes.
+
 ## [1.5.0] - 2026-08-05
 ### Added
 - **Straight motion path segments now use tangent easing**. Useful when a shape has to stay pinned to a corner of something that is scaling.

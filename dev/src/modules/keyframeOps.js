@@ -1,7 +1,7 @@
 // Keyframe operations module
 // Functions for extracting and applying easing to keyframes
 
-import { cubicBezierToCavalry, cavalryToCubicBezier, cubicBezierToVelocity, getCompositionFrameRate, framesToMilliseconds } from './conversions.js';
+import { cubicBezierToCavalry, cavalryToCubicBezier, cubicBezierToVelocity, velocityToCubicBezier, getCompositionFrameRate, framesToMilliseconds } from './conversions.js';
 
 var DEFAULT_LEFT_SPEED = 0.0;
 var DEFAULT_LEFT_INFLUENCE = 0.333;
@@ -42,6 +42,47 @@ function getSiblingKeyframeTimesSet(layerId, attrId) {
     } catch (e) {
         return new Set();
     }
+}
+
+/**
+ * True when Cavalry evaluates this segment from speed + influence rather than from the
+ * bezier handles. Handles are only honoured while both bounding speeds are 1; attributes
+ * with no speed data at all (everything that isn't a motion path) are always handle-driven.
+ * @param {Object} frameZeroData - key data at the start of the segment
+ * @param {Object} frameEndData - key data at the end of the segment
+ */
+function segmentUsesVelocity(frameZeroData, frameEndData) {
+    var outSpeed = frameZeroData ? frameZeroData.rightSpeed : null;
+    var inSpeed = frameEndData ? frameEndData.leftSpeed : null;
+    if (outSpeed === undefined || outSpeed === null || inSpeed === undefined || inSpeed === null) {
+        return false;
+    }
+    return Math.abs(outSpeed - TANGENT_MODE_SPEED) > TANGENT_SPEED_EPSILON ||
+        Math.abs(inSpeed - TANGENT_MODE_SPEED) > TANGENT_SPEED_EPSILON;
+}
+
+/**
+ * Keyframe ids for the given frames, in frame order.
+ * api.getSelectedKeyframeIds() returns ids in selection order, which is not frame order —
+ * pairing those with a sorted frame list silently processes segments backwards.
+ * @param {string} layerId
+ * @param {string} attrId
+ * @param {number[]} frames - sorted frames
+ * @returns {string[]} ids aligned to frames (missing frames yield null)
+ */
+function keyframeIdsForFrames(layerId, attrId, frames) {
+    var times = [];
+    var ids = [];
+    try {
+        times = api.getKeyframeTimes(layerId, attrId) || [];
+        ids = api.getKeyframeIdsForAttribute(layerId, attrId) || [];
+    } catch (e) {
+        return frames.map(function () { return null; });
+    }
+    return frames.map(function (frame) {
+        var index = times.indexOf(frame);
+        return index === -1 ? null : ids[index];
+    });
 }
 
 /**
@@ -133,6 +174,7 @@ function unlockKeyframePair(keyframeIdA, keyframeIdB, frameA, frameB, attrId, la
 }
 
 var TANGENT_MODE_SPEED = 1.0;
+var TANGENT_SPEED_EPSILON = 0.0001;
 var STRAIGHT_PATH_TOLERANCE_FRACTION = 0.005;   // 0.5% of the segment's chord length
 var STRAIGHT_PATH_TOLERANCE_MIN = 0.5;          // units, floor for very short moves
 var STRAIGHT_PATH_SAMPLES = 9;
@@ -621,19 +663,14 @@ export function getEasingFromKeyframes(currentEasing) {
                 var layerId = fullAttributePath.substring(0, dotAfterHash);
                 var attrId = fullAttributePath.substring(dotAfterHash + 1);
                 
-                var attributeKeyframeIds = [];
-                for (var i = 0; i < keyframeIds.length; i++) {
-                    var keyframeAttrPath = api.getAttributeFromKeyframeId(keyframeIds[i]);
-                    if (keyframeAttrPath === fullAttributePath) {
-                        attributeKeyframeIds.push(keyframeIds[i]);
-                    }
-                }
-                
-                if (attributeKeyframeIds.length >= 2) {
+                var sortedFrames = frames.sort((a, b) => a - b);
+                var attributeKeyframeIds = keyframeIdsForFrames(layerId, attrId, sortedFrames);
+
+                if (attributeKeyframeIds.length >= 2 && attributeKeyframeIds.every(Boolean)) {
                     attributeGroups[fullAttributePath] = {
                         layerId: layerId,
                         attrId: attrId,
-                        frames: frames.sort((a, b) => a - b),
+                        frames: sortedFrames,
                         keyframeIds: attributeKeyframeIds
                     };
                 }
@@ -648,6 +685,9 @@ export function getEasingFromKeyframes(currentEasing) {
         var totalX1 = 0, totalY1 = 0, totalX2 = 0, totalY2 = 0;
         var pairCount = 0;
         var currentFrame = api.getFrame();
+        // A motion path's two axes carry identical velocity, so reading both would count the
+        // same segment twice and report a bogus "averaged from 2 pairs".
+        var seenPathSegments = new Set();
         
         for (let [attributePath, group] of Object.entries(attributeGroups)) {
             for (var i = 0; i < group.keyframeIds.length - 1; i++) {
@@ -659,7 +699,14 @@ export function getEasingFromKeyframes(currentEasing) {
                 var frameDiff = secondFrame - firstFrame;
                 
                 if (frameDiff <= 0) continue;
-                
+
+                var isPositionAxis = group.attrId === 'position.x' || group.attrId === 'position.y';
+                if (isPositionAxis) {
+                    var segmentKey = group.layerId + '|position|' + firstFrame + '|' + secondFrame;
+                    if (seenPathSegments.has(segmentKey)) continue;
+                    seenPathSegments.add(segmentKey);
+                }
+
                 api.setFrame(firstFrame);
                 var firstValue = api.get(group.layerId, group.attrId);
                 api.setFrame(secondFrame);
@@ -692,7 +739,21 @@ export function getEasingFromKeyframes(currentEasing) {
                     inHandleY = frameEndData.leftBez.y;
                 }
                 
-                if (outHandleX !== null && inHandleX !== null) {
+                if (segmentUsesVelocity(frameZeroData, frameEndData)) {
+                    // Velocity-eased motion path segment: the handles are flat, the easing
+                    // lives in speed + influence.
+                    var velocityBezier = velocityToCubicBezier(
+                        frameZeroData.rightSpeed,
+                        frameZeroData.rightInfluence,
+                        frameEndData.leftSpeed,
+                        frameEndData.leftInfluence
+                    );
+                    totalX1 += velocityBezier.x1;
+                    totalY1 += velocityBezier.y1;
+                    totalX2 += velocityBezier.x2;
+                    totalY2 += velocityBezier.y2;
+                    pairCount++;
+                } else if (outHandleX !== null && inHandleX !== null) {
                     var bezier = cavalryToCubicBezier(outHandleX, outHandleY, inHandleX, inHandleY, frameDiff, valueDiff);
                     totalX1 += bezier.x1;
                     totalY1 += bezier.y1;
@@ -810,21 +871,14 @@ export function applyEasingToKeyframes(currentEasing) {
                 var layerId = fullAttributePath.substring(0, dotAfterHash);
                 var attrId = fullAttributePath.substring(dotAfterHash + 1);
                 
-                var attributeKeyframeIds = [];
-                
-                for (var i = 0; i < keyframeIds.length; i++) {
-                    var keyframeAttrPath = api.getAttributeFromKeyframeId(keyframeIds[i]);
-                    
-                    if (keyframeAttrPath === fullAttributePath) {
-                        attributeKeyframeIds.push(keyframeIds[i]);
-                    }
-                }
-                
-                if (attributeKeyframeIds.length >= 2) {
+                var sortedFrames = frames.sort((a, b) => a - b);
+                var attributeKeyframeIds = keyframeIdsForFrames(layerId, attrId, sortedFrames);
+
+                if (attributeKeyframeIds.length >= 2 && attributeKeyframeIds.every(Boolean)) {
                     attributeGroups[fullAttributePath] = {
                         layerId: layerId,
                         attrId: attrId,
-                        frames: frames.sort((a, b) => a - b),
+                        frames: sortedFrames,
                         keyframeIds: attributeKeyframeIds
                     };
                 }
@@ -984,17 +1038,13 @@ export function fixHoldPaths() {
             var layerId = fullAttributePath.substring(0, dotAfterHash);
             var attrId = fullAttributePath.substring(dotAfterHash + 1);
 
-            var attributeKeyframeIds = [];
-            for (var i = 0; i < keyframeIds.length; i++) {
-                if (api.getAttributeFromKeyframeId(keyframeIds[i]) === fullAttributePath) {
-                    attributeKeyframeIds.push(keyframeIds[i]);
-                }
-            }
-            if (attributeKeyframeIds.length >= 2) {
+            var sortedFrames = frames.sort(function (a, b) { return a - b; });
+            var attributeKeyframeIds = keyframeIdsForFrames(layerId, attrId, sortedFrames);
+            if (attributeKeyframeIds.length >= 2 && attributeKeyframeIds.every(Boolean)) {
                 attributeGroups[fullAttributePath] = {
                     layerId: layerId,
                     attrId: attrId,
-                    frames: frames.sort(function (a, b) { return a - b; }),
+                    frames: sortedFrames,
                     keyframeIds: attributeKeyframeIds
                 };
             }

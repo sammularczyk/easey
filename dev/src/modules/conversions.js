@@ -79,10 +79,12 @@ export function cavalryToCubicBezier(outHandleX, outHandleY, inHandleX, inHandle
  * @returns {{ rightSpeed: number, rightInfluence: number, leftSpeed: number, leftInfluence: number }}
  */
 export function cubicBezierToVelocity(x1, y1, x2, y2) {
+    // Measured against Cavalry: influence is clamped to [0.01, 1] and negative speed to 0,
+    // but speed has no upper bound (10 stores and animates fine). Capping it here flattened
+    // every snappy curve — Ease Out Expo alone needs speed 6.25.
     var MIN_INFLUENCE = 0.01;
     var MAX_INFLUENCE = 1.0;
     var MIN_SPEED = 0.0;
-    var MAX_SPEED = 2.0;
     var EPS = 0.0001;
 
     var nx1 = Math.max(0, Math.min(1, x1));
@@ -95,7 +97,7 @@ export function cubicBezierToVelocity(x1, y1, x2, y2) {
     if (Math.abs(nx1) > EPS) {
         var rs = y1 / nx1;
         if (isFinite(rs)) {
-            rightSpeed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, rs));
+            rightSpeed = Math.max(MIN_SPEED, rs);
         }
     }
 
@@ -104,7 +106,7 @@ export function cubicBezierToVelocity(x1, y1, x2, y2) {
     if (Math.abs(oneMinusX2) > EPS) {
         var ls = (1 - y2) / oneMinusX2;
         if (isFinite(ls)) {
-            leftSpeed = Math.max(MIN_SPEED, Math.min(MAX_SPEED, ls));
+            leftSpeed = Math.max(MIN_SPEED, ls);
         }
     }
 
@@ -113,6 +115,25 @@ export function cubicBezierToVelocity(x1, y1, x2, y2) {
         rightInfluence: rightInfluence,
         leftSpeed: leftSpeed,
         leftInfluence: leftInfluence
+    };
+}
+
+/**
+ * Inverse of cubicBezierToVelocity: rebuild a normalized cubic-bezier from Cavalry's
+ * motion-path speed + influence. Use for segments Cavalry evaluates by velocity rather
+ * than by bezier handles, where the handles hold nothing useful.
+ * @param {number} rightSpeed - outgoing speed at the start keyframe
+ * @param {number} rightInfluence - outgoing influence at the start keyframe
+ * @param {number} leftSpeed - incoming speed at the end keyframe
+ * @param {number} leftInfluence - incoming influence at the end keyframe
+ * @returns {Object} Cubic bezier values {x1, y1, x2, y2}
+ */
+export function velocityToCubicBezier(rightSpeed, rightInfluence, leftSpeed, leftInfluence) {
+    return {
+        x1: rightInfluence,
+        y1: rightSpeed * rightInfluence,
+        x2: 1 - leftInfluence,
+        y2: 1 - leftSpeed * leftInfluence
     };
 }
 
