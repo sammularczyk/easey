@@ -29,3 +29,6 @@ npm-debug.log*
 
 # Agent tooling
 .maki/
+
+# Generated per build, not source
+dev/src/modules/buildInfo.js

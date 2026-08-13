@@ -74,6 +74,9 @@ import {
     populatePresetDropdown, copyCubicBezierToClipboard
 } from './modules/presetManager.js';
 import { initializeAssets, getAssetPath } from './modules/embeddedAssets.js';
+import { BUILD_ID } from './modules/buildInfo.js';
+import { buildTabStrip, buildIconButton, buildBottomBar } from './modules/chrome.js';
+import { getTokens } from './modules/theme.js';
 
 // Initialize embedded assets (writes icons to temp folder if needed)
 initializeAssets();
@@ -128,6 +131,13 @@ var axisConstraint = null;
 var speedDragging = false;
 var speedDragHandle = null;
 
+// Hover state, drives the handle grow affordance on each graph
+var hoveredHandle = null;
+var speedHoveredHandle = null;
+
+// Window width below which the tab strip drops its labels and shows icons only
+var TAB_LABEL_MIN_WIDTH = 240;
+
 // Settings
 var applyOnDragEnabled = false;
 var clampHoldsEnabled = true;
@@ -144,24 +154,19 @@ var isInitializingTab = false;
 // Create canvases
 var graphCanvas = new ui.Draw();
 graphCanvas.setSize(graphWidth, graphHeight);
+// Without this, onMouseMove only fires while a button is held, so handles
+// would have no hover affordance.
+graphCanvas.useHoverEvents(true);
 
 var speedGraphCanvas = new ui.Draw();
 speedGraphCanvas.setSize(speedGraphWidth, speedGraphHeight);
+speedGraphCanvas.useHoverEvents(true);
 
 // Main action buttons
-var applyButton = new ui.ImageButton(getAssetPath("icon-apply"));
-applyButton.setToolTip("Apply easing");
-applyButton.setImageSize(16,16);
-applyButton.setSize(24, 24);
-
-var getButton = new ui.ImageButton(getAssetPath("icon-get"));
-getButton.setToolTip("Get easing from keyframes");
-getButton.setImageSize(16,16);
-getButton.setSize(24, 24);
-
-// Context menu button for main actions
-var mainContextButton = new ui.Button("⋯");
-mainContextButton.setSize(18, 18);
+// Drawn rather than ImageButtons so they can carry the accent fill and a hover
+// state; ui.ImageButton offers neither.
+var applyButton = buildIconButton("apply", "Apply easing");
+var getButton = buildIconButton("get", "Get easing from keyframes");
 
 // Text input for cubic bezier values
 var bezierInput = new ui.LineEdit();
@@ -173,6 +178,9 @@ var presetList = new ui.DropDown();
 // Context menu button for preset actions
 var presetContextButton = new ui.ImageButton(getAssetPath("icon-settings"));
 presetContextButton.setDrawStroke(false);
+// ImageButton always paints a background; matching the window is the only way
+// to make it disappear.
+presetContextButton.setBackgroundColor(getTokens().windowBg);
 presetContextButton.setToolTip("Settings");
 presetContextButton.setImageSize(16,16);
 presetContextButton.setSize(18, 18);
@@ -198,7 +206,11 @@ var sharedState = {
     get speedDragging() { return speedDragging; },
     set speedDragging(v) { speedDragging = v; },
     get speedDragHandle() { return speedDragHandle; },
-    set speedDragHandle(v) { speedDragHandle = v; }
+    set speedDragHandle(v) { speedDragHandle = v; },
+    get hoveredHandle() { return hoveredHandle; },
+    set hoveredHandle(v) { hoveredHandle = v; },
+    get speedHoveredHandle() { return speedHoveredHandle; },
+    set speedHoveredHandle(v) { speedHoveredHandle = v; }
 };
 
 // Get current graph config
@@ -207,7 +219,8 @@ function getGraphConfig() {
         width: graphWidth,
         height: graphHeight,
         padding: graphPadding,
-        handleRadius: handleRadius
+        handleRadius: handleRadius,
+        hoveredHandle: hoveredHandle
     };
 }
 
@@ -216,8 +229,15 @@ function getSpeedGraphConfig() {
         width: speedGraphWidth,
         height: speedGraphHeight,
         padding: speedGraphPadding,
-        handleRadius: speedHandleRadius
+        handleRadius: speedHandleRadius,
+        hoveredHandle: speedHoveredHandle
     };
+}
+
+// Round to 3 decimals, then drop trailing zeros: 0.500 -> 0.5, 1.000 -> 1.
+// parseFloat also normalises -0 to 0.
+function formatBezierValue(value) {
+    return String(parseFloat(value.toFixed(3)));
 }
 
 // Update text input with current easing values
@@ -227,10 +247,7 @@ function updateTextInput() {
     var x2 = (currentEasing.x2 !== undefined) ? currentEasing.x2 : 0.25;
     var y2 = (currentEasing.y2 !== undefined) ? currentEasing.y2 : 1.0;
     
-    var text = x1.toFixed(3) + ", " + 
-               y1.toFixed(3) + ", " + 
-               x2.toFixed(3) + ", " + 
-               y2.toFixed(3);
+    var text = [x1, y1, x2, y2].map(formatBezierValue).join(", ");
     
     isUpdatingTextInput = true;
     bezierInput.setText(text);
@@ -267,7 +284,7 @@ function redrawGraphs() {
 // Save tab preference wrapper
 function saveTabPreference() {
     if (!isInitializingTab) {
-        saveLastSelectedTab(tabView.currentTab());
+        saveLastSelectedTab(pageView.currentPage());
     }
 }
 
@@ -289,6 +306,11 @@ setupValueGraphHandlers({
             applyEasingToKeyframes(currentEasing);
         }
         saveTabPreference();
+    },
+    onHoverChange: function() {
+        // Only the hovered canvas needs repainting, and hover must not touch
+        // the text input or trigger apply-on-drag the way onUpdate does.
+        drawCurve(graphCanvas, currentEasing, getGraphConfig());
     }
 });
 
@@ -306,6 +328,9 @@ setupSpeedGraphHandlers({
     onDragEnd: function() {
         presetList.setText("Select a preset...");
         saveTabPreference();
+    },
+    onHoverChange: function() {
+        drawSpeedCurve(speedGraphCanvas, currentEasing, speedEasing, getSpeedGraphConfig());
     }
 });
 
@@ -453,7 +478,9 @@ function showPresetContextMenu() {
     ui.addMenuItem(separatorItem);
 
     ui.addMenuItem({
-        name: "Easey Version " + currentVersion,
+        // Build ID identifies which bundle is actually loaded. currentVersion
+        // itself stays clean so the update check keeps comparing versions.
+        name: "Easey Version " + currentVersion + " (build " + BUILD_ID + ")",
         enabled: false
     });
     ui.addMenuItem({
@@ -475,21 +502,18 @@ function showPresetContextMenu() {
 // BUTTON EVENT HANDLERS
 // ============================================================================
 
-applyButton.onClick = function() {
+// Containers signal clicks through onMousePress, not onClick.
+applyButton.onMousePress = function() {
     applyEasingToKeyframes(currentEasing);
     saveTabPreference();
 };
 
-getButton.onClick = function() {
+getButton.onMousePress = function() {
     if (getEasingFromKeyframes(currentEasing)) {
         updateTextInput();
         redrawGraphs();
     }
     saveTabPreference();
-};
-
-mainContextButton.onClick = function() {
-    showPresetContextMenu();
 };
 
 presetContextButton.onClick = function() {
@@ -554,42 +578,50 @@ var mainLayout = new ui.VLayout();
 mainLayout.setSpaceBetween(0);
 mainLayout.setMargins(3, 3, 3, 3);
 
-// Preset row
+// Preset row. The dropdown goes away in favour of the Presets page; until then
+// it keeps its own row, with the gear moved up into the bottom bar row.
 var presetRow = new ui.HLayout();
 presetRow.add(presetList);
-presetRow.add(presetContextButton);
 presetRow.setMargins(0, 4, 0, 0);
 
-// Create TabView
-var tabView = new ui.TabView();
-
-// VALUE TAB
+// VALUE PAGE
 var valueTabLayout = new ui.VLayout();
 valueTabLayout.setSpaceBetween(0);
 valueTabLayout.setMargins(0, 0, 0, 0);
 valueTabLayout.add(graphCanvas);
 valueTabLayout.addStretch();
 
-// SPEED TAB
+// SPEED PAGE
 var speedTabLayout = new ui.VLayout();
 speedTabLayout.setSpaceBetween(0);
 speedTabLayout.setMargins(0, 0, 0, 0);
 speedTabLayout.add(speedGraphCanvas);
 speedTabLayout.addStretch();
 
-// Add tabs (Speed first to match After Effects workflow)
-tabView.add("Speed", speedTabLayout);
-tabView.add("Value", valueTabLayout);
+// PageView rather than TabView: TabView's chrome cannot be styled at all, so
+// the tab strip above is built by hand and drives the pages directly.
+var pageView = new ui.PageView();
+pageView.add(valueTabLayout);
+pageView.add(speedTabLayout);
+
+var tabStrip = buildTabStrip([
+    { label: "Value", icon: "value" },
+    { label: "Speed", icon: "speed" }
+], function(index) {
+    pageView.setPage(index);
+    redrawGraphs();
+    saveTabPreference();
+});
 
 // Add to main layout
-mainLayout.add(tabView);
+mainLayout.add(tabStrip.widget);
+mainLayout.add(pageView);
 
-// Button row
+// Bottom bar: get, field and apply share one rounded surface, gear sits outside
 var buttonRow = new ui.HLayout();
-buttonRow.add(getButton);
-buttonRow.add(bezierInput);
-buttonRow.add(applyButton);
-buttonRow.setSpaceBetween(4);
+buttonRow.add(buildBottomBar(bezierInput, getButton, applyButton));
+buttonRow.add(presetContextButton);
+buttonRow.setSpaceBetween(7);
 buttonRow.setMargins(0, 4, 0, 0);
 mainLayout.add(buttonRow);
 mainLayout.add(presetRow);
@@ -603,11 +635,8 @@ ui.setBackgroundColor(ui.getThemeColor("Base"));
 updateTextInput();
 redrawGraphs();
 
-// Tab change handler
-tabView.onTabChanged = function() {
-    redrawGraphs();
-    saveTabPreference();
-};
+// PageView has no onPageChanged callback; the tab strip's onSelect above is
+// the only way pages change, and it already redraws and saves.
 
 // Window size
 ui.setMinimumWidth(graphWidth);
@@ -618,8 +647,14 @@ ui.onResize = function() {
     var newWidth = ui.size().width;
     var newHeight = ui.size().height;
     
-    var controlsHeight = 90;
-    var margin = 10;
+    // Tab strip (29) + bottom bar row (33) + preset row + window margins. Must
+    // over- rather than under-estimate: too small and the window grows a
+    // scrollbar, which overlaps the controls.
+    var controlsHeight = 115;
+    var margin = 6;
+
+    // Below this the labels no longer fit beside the icons.
+    tabStrip.setCompact(newWidth < TAB_LABEL_MIN_WIDTH);
     
     var newGraphWidth = Math.max(150, newWidth - margin);
     var newGraphHeight = Math.max(150, newHeight - controlsHeight);
@@ -638,11 +673,14 @@ ui.onResize = function() {
 // Show window
 ui.show();
 
-// Restore last selected tab
+// Restore last selected tab. Clamped because the tab count changes between
+// versions, so a stored index can outrun the pages that exist.
 isInitializingTab = true;
 var savedTab = loadLastSelectedTab();
 if (savedTab !== null) {
-    tabView.setTab(savedTab);
+    var restoredTab = Math.max(0, Math.min(pageView.pageCount() - 1, savedTab));
+    pageView.setPage(restoredTab);
+    tabStrip.setSelected(restoredTab);
 }
 
 // Reset init flag after delay

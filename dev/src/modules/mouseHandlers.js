@@ -4,6 +4,84 @@
 import { speedToCubicBezier } from './conversions.js';
 
 /**
+ * On-screen positions of the value graph's two control handles, clamped the
+ * same way graphRenderer clamps them so hit-testing matches what is drawn.
+ * @param {Object} config - Graph configuration
+ * @param {Object} state - Shared state object
+ * @returns {Object} {cp1: {x, y}, cp2: {x, y}}
+ */
+function valueHandlePositions(config, state) {
+    var startX = config.padding;
+    var startY = config.height - config.padding;
+    var endX = config.width - config.padding;
+    var endY = config.padding;
+
+    var cp1X = startX + state.currentEasing.x1 * (endX - startX);
+    var cp1Y = endY + state.currentEasing.y1 * (startY - endY);
+    var cp2X = startX + state.currentEasing.x2 * (endX - startX);
+    var cp2Y = endY + state.currentEasing.y2 * (startY - endY);
+
+    return {
+        cp1: {
+            x: Math.max(startX - 20, Math.min(endX + 20, cp1X)),
+            y: Math.max(endY - 20, Math.min(startY + 20, cp1Y))
+        },
+        cp2: {
+            x: Math.max(startX - 20, Math.min(endX + 20, cp2X)),
+            y: Math.max(endY - 20, Math.min(startY + 20, cp2Y))
+        }
+    };
+}
+
+/**
+ * On-screen positions of the speed graph's influence handles.
+ * @param {Object} config - Graph configuration
+ * @param {Object} state - Shared state object
+ * @returns {Object} {out: {x, y}, in: {x, y}}
+ */
+function speedHandlePositions(config, state) {
+    var startX = config.padding;
+    var startY = config.height - config.padding;
+    var endX = config.width - config.padding;
+    var endY = config.padding;
+    var midX = startX + (endX - startX) / 2;
+    var graphHeight = startY - endY;
+
+    return {
+        out: {
+            x: startX + (state.speedEasing.outInfluence / 100) * (midX - startX),
+            y: endY + (state.speedEasing.outSpeedY * graphHeight)
+        },
+        in: {
+            x: endX - (state.speedEasing.inInfluence / 100) * (endX - midX),
+            y: endY + (state.speedEasing.inSpeedY * graphHeight)
+        }
+    };
+}
+
+/**
+ * First handle within grabbing distance, tested in the given order.
+ * @param {Object} position - {x, y} mouse position
+ * @param {Object} handles - Map of handle key to {x, y}
+ * @param {Array} order - Handle keys, highest priority first
+ * @param {number} radius - Grab radius
+ * @returns {string|null} Handle key, or null when none is close enough
+ */
+function handleAt(position, handles, order, radius) {
+    for (var i = 0; i < order.length; i++) {
+        var handle = handles[order[i]];
+        var dx = position.x - handle.x;
+        var dy = position.y - handle.y;
+
+        if (Math.sqrt(dx * dx + dy * dy) < radius) {
+            return order[i];
+        }
+    }
+
+    return null;
+}
+
+/**
  * Create mouse handlers for the value graph canvas
  * @param {Object} options - Handler options
  * @param {Object} options.canvas - The graph canvas element
@@ -11,6 +89,7 @@ import { speedToCubicBezier } from './conversions.js';
  * @param {Function} options.getConfig - Function that returns current graph configuration
  * @param {Function} options.onUpdate - Callback when values are updated
  * @param {Function} options.onDragEnd - Callback when drag ends
+ * @param {Function} options.onHoverChange - Callback when the hovered handle changes
  */
 export function setupValueGraphHandlers(options) {
     var canvas = options.canvas;
@@ -18,58 +97,41 @@ export function setupValueGraphHandlers(options) {
     var getConfig = options.getConfig;
     var onUpdate = options.onUpdate;
     var onDragEnd = options.onDragEnd;
-    
+    var onHoverChange = options.onHoverChange;
+
     canvas.onMousePress = function(position, button) {
         var config = getConfig();
-        var startX = config.padding;
-        var startY = config.height - config.padding;
-        var endX = config.width - config.padding;
-        var endY = config.padding;
-        
-        // Calculate actual handle positions
-        var actualCp1X = startX + state.currentEasing.x1 * (endX - startX);
-        var actualCp1Y = endY + state.currentEasing.y1 * (startY - endY);
-        var actualCp2X = startX + state.currentEasing.x2 * (endX - startX);
-        var actualCp2Y = endY + state.currentEasing.y2 * (startY - endY);
-        
-        // Clamp handle positions for click detection
-        var cp1X = Math.max(startX - 20, Math.min(endX + 20, actualCp1X));
-        var cp1Y = Math.max(endY - 20, Math.min(startY + 20, actualCp1Y));
-        var cp2X = Math.max(startX - 20, Math.min(endX + 20, actualCp2X));
-        var cp2Y = Math.max(endY - 20, Math.min(startY + 20, actualCp2Y));
-        
-        var dist1 = Math.sqrt((position.x - cp1X) * (position.x - cp1X) + (position.y - cp1Y) * (position.y - cp1Y));
-        var dist2 = Math.sqrt((position.x - cp2X) * (position.x - cp2X) + (position.y - cp2Y) * (position.y - cp2Y));
-        
-        if (dist1 < config.handleRadius * 2) {
-            state.isDragging = true;
-            state.dragHandle = 'cp1';
-            state.dragStartPosition = { x: position.x, y: position.y };
-            state.dragStartEasing = {
-                x1: state.currentEasing.x1,
-                y1: state.currentEasing.y1,
-                x2: state.currentEasing.x2,
-                y2: state.currentEasing.y2
-            };
-            state.axisConstraint = null;
-        } else if (dist2 < config.handleRadius * 2) {
-            state.isDragging = true;
-            state.dragHandle = 'cp2';
-            state.dragStartPosition = { x: position.x, y: position.y };
-            state.dragStartEasing = {
-                x1: state.currentEasing.x1,
-                y1: state.currentEasing.y1,
-                x2: state.currentEasing.x2,
-                y2: state.currentEasing.y2
-            };
-            state.axisConstraint = null;
-        }
+        var handles = valueHandlePositions(config, state);
+        var hit = handleAt(position, handles, ['cp1', 'cp2'], config.handleRadius * 2);
+
+        if (!hit) return;
+
+        state.isDragging = true;
+        state.dragHandle = hit;
+        state.dragStartPosition = { x: position.x, y: position.y };
+        state.dragStartEasing = {
+            x1: state.currentEasing.x1,
+            y1: state.currentEasing.y1,
+            x2: state.currentEasing.x2,
+            y2: state.currentEasing.y2
+        };
+        state.axisConstraint = null;
     };
-    
+
     canvas.onMouseMove = function(position, modifiers) {
-        if (!state.isDragging) return;
-        
         var config = getConfig();
+
+        // Fires without a button held because the canvas enables hover events.
+        if (!state.isDragging) {
+            var hovered = handleAt(position, valueHandlePositions(config, state), ['cp1', 'cp2'], config.handleRadius * 2);
+
+            if (hovered !== state.hoveredHandle) {
+                state.hoveredHandle = hovered;
+                if (onHoverChange) onHoverChange();
+            }
+            return;
+        }
+
         var startX = config.padding;
         var startY = config.height - config.padding;
         var endX = config.width - config.padding;
@@ -168,6 +230,7 @@ export function setupValueGraphHandlers(options) {
  * @param {Function} options.getConfig - Function that returns current graph configuration
  * @param {Function} options.onUpdate - Callback when values are updated
  * @param {Function} options.onDragEnd - Callback when drag ends
+ * @param {Function} options.onHoverChange - Callback when the hovered handle changes
  */
 export function setupSpeedGraphHandlers(options) {
     var canvas = options.canvas;
@@ -175,37 +238,33 @@ export function setupSpeedGraphHandlers(options) {
     var getConfig = options.getConfig;
     var onUpdate = options.onUpdate;
     var onDragEnd = options.onDragEnd;
-    
+    var onHoverChange = options.onHoverChange;
+
     canvas.onMousePress = function(position, button) {
         var config = getConfig();
-        var startX = config.padding;
-        var startY = config.height - config.padding;
-        var endX = config.width - config.padding;
-        var endY = config.padding;
-        var midX = startX + (endX - startX) / 2;
-        var graphHeight = startY - endY;
-        
-        var outHandleX = startX + (state.speedEasing.outInfluence / 100) * (midX - startX);
-        var inHandleX = endX - (state.speedEasing.inInfluence / 100) * (endX - midX);
-        var outHandleY = endY + (state.speedEasing.outSpeedY * graphHeight);
-        var inHandleY = endY + (state.speedEasing.inSpeedY * graphHeight);
-        
-        var dist1 = Math.sqrt(Math.pow(position.x - outHandleX, 2) + Math.pow(position.y - outHandleY, 2));
-        var dist2 = Math.sqrt(Math.pow(position.x - inHandleX, 2) + Math.pow(position.y - inHandleY, 2));
-        
-        if (dist1 < config.handleRadius * 2) {
-            state.speedDragging = true;
-            state.speedDragHandle = 'out';
-        } else if (dist2 < config.handleRadius * 2) {
-            state.speedDragging = true;
-            state.speedDragHandle = 'in';
-        }
+        var handles = speedHandlePositions(config, state);
+        var hit = handleAt(position, handles, ['out', 'in'], config.handleRadius * 2);
+
+        if (!hit) return;
+
+        state.speedDragging = true;
+        state.speedDragHandle = hit;
     };
-    
+
     canvas.onMouseMove = function(position, modifiers) {
-        if (!state.speedDragging) return;
-        
         var config = getConfig();
+
+        // Fires without a button held because the canvas enables hover events.
+        if (!state.speedDragging) {
+            var hovered = handleAt(position, speedHandlePositions(config, state), ['out', 'in'], config.handleRadius * 2);
+
+            if (hovered !== state.speedHoveredHandle) {
+                state.speedHoveredHandle = hovered;
+                if (onHoverChange) onHoverChange();
+            }
+            return;
+        }
+
         var startX = config.padding;
         var startY = config.height - config.padding;
         var endX = config.width - config.padding;

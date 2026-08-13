@@ -20,11 +20,13 @@ export var DEFAULT_EASING = {
     y2: 1.0
 };
 
-// Graph dimensions
+// Graph dimensions. padding is the inset between the canvas edge and the plot,
+// so lowering it grows the plot without changing the window layout. It has to
+// stay clear of the 20px handle overshoot clamp plus the handle and its shadow.
 export var GRAPH_CONFIG = {
     width: 230,
     height: 230,
-    padding: 40,
+    padding: 30,
     handleRadius: 6
 };
 
