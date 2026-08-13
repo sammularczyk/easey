@@ -187,6 +187,8 @@ export function buildIconButton(iconKey, tooltip) {
     container.setFixedHeight(icon.height);
     container.setLayout(layout);
     container.setToolTip(tooltip);
+    // Enter/leave only fire once the Container is opted into hover events.
+    container.useHoverEvents(true);
 
     function paint(background) {
         container.setBackgroundColor(background);
@@ -299,6 +301,7 @@ export function buildTabStrip(tabs, onSelect) {
         container.setRadius(TAB_RADIUS, TAB_RADIUS, TAB_RADIUS, TAB_RADIUS);
         container.setFixedHeight(TAB_HEIGHT);
         container.setLayout(content);
+        container.useHoverEvents(true);
 
         entries.push({
             container: container,

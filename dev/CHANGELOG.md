@@ -16,6 +16,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 -   `Security` in case of vulnerabilities
 
 
+## [2.0.0] - 2026-08-13
+### Added
+- **Preset libraries.** Presets now live in named libraries with their own section headers, and can be renamed, moved between libraries, and deleted from a menu on each row. Existing presets are migrated automatically into a "My Presets" library.
+- **Export and import libraries** as JSON files.
+- **A Presets tab**, replacing the preset dropdown. Each row draws a live thumbnail of its own curve. Clicking a preset applies it to the selected keyframes.
+- Handles grow on hover, and the tab strip collapses to icons when the window is too narrow for labels.
+
+### Changed
+- **Rebuilt UI**: a segmented tab strip, a single composite bottom bar, and green accented controls.
+- Colours now follow the Cavalry theme rather than being hardcoded, so Easey no longer assumes a dark UI.
+- Curve values drop trailing zeros — `0.5, 0, 0, 1` rather than `0.500, 0.000, 0.000, 1.000`.
+- Preset rename and delete moved out of the settings menu and onto each preset's own menu; export and delete for a whole library moved onto the library's menu. Saving a preset now asks which library to put it in.
+
+### Fixed
+- The curve is no longer invisible on light Cavalry themes.
+- Deleting a preset now asks for confirmation.
+
 ## [1.5.1] - 2026-08-07
 ### Fixed
 - Applying easing to some of a layer's keyframes no longer affects surrounding keyframes.

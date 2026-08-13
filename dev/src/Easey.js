@@ -58,25 +58,29 @@
 // 7. Use context menu items to copy keyframe duration, values, and easing info
 
 // Import modules
-import { DEFAULT_PRESETS, DEFAULT_EASING, GRAPH_CONFIG, DEFAULT_SPEED_EASING } from './modules/constants.js';
+import { DEFAULT_EASING, GRAPH_CONFIG, DEFAULT_SPEED_EASING } from './modules/constants.js';
 import { checkForUpdate } from './modules/updateChecker.js';
 import { getCompositionFrameRate } from './modules/conversions.js';
 import { drawCurve, drawSpeedCurve } from './modules/graphRenderer.js';
 import { setupValueGraphHandlers, setupSpeedGraphHandlers } from './modules/mouseHandlers.js';
 import { getEasingFromKeyframes, applyEasingToKeyframes, fixHoldPaths, setClampHoldsEnabled, copyKeyframeDuration, copyKeyframeValues, copyAllKeyframeInfo } from './modules/keyframeOps.js';
 import { 
-    savePreset, renamePreset, deletePreset, deleteAllPresets,
-    exportPresets, importPresets, savePresetsToPreferences, loadPresetsFromPreferences,
+    loadLibraries, saveLibraries, createLibrary, renameLibrary, deleteLibrary,
+    exportLibrary, importLibrary, savePresetToLibrary, renameLibraryPreset,
+    deleteLibraryPreset, movePresetToLibrary,
     saveApplyOnDragSetting, loadApplyOnDragSetting,
     saveClampIdenticalSetting, loadClampIdenticalSetting,
     saveUpdateCheckSetting, loadUpdateCheckSetting,
     saveLastSelectedTab, loadLastSelectedTab,
-    populatePresetDropdown, copyCubicBezierToClipboard
+    savePresetLayoutSetting, loadPresetLayoutSetting,
+    saveDismissedUpdate, loadDismissedUpdate,
+    copyCubicBezierToClipboard
 } from './modules/presetManager.js';
 import { initializeAssets, getAssetPath } from './modules/embeddedAssets.js';
 import { BUILD_ID } from './modules/buildInfo.js';
 import { buildTabStrip, buildIconButton, buildBottomBar } from './modules/chrome.js';
 import { getTokens } from './modules/theme.js';
+import { createPresetsPage } from './modules/presetsPage.js';
 
 // Initialize embedded assets (writes icons to temp folder if needed)
 initializeAssets();
@@ -87,20 +91,26 @@ ui.setTitle("Easey");
 // Version info
 var GITHUB_REPO = "sammularczyk/Easey";
 var scriptName = "Easey";
-var currentVersion = "1.5.1";
+var currentVersion = "2.0.0";
+var DOWNLOAD_URL = "https://github.com/sammularczyk/Easey/releases/latest/download/Easey.jsc";
 
-// Check for updates (unless the user turned it off)
-var updateCheckEnabled = loadUpdateCheckSetting();
-if (updateCheckEnabled) {
-    checkForUpdate(GITHUB_REPO, scriptName, currentVersion);
-}
+// Set when a newer version exists, which overlays a banner on the graphs.
+var updateAvailable = false;
+var latestVersion = null;
+// Forces that banner on so its appearance can be checked without a release.
+var previewUpdateBanner = false;
+// Dismissing a previewed banner is remembered separately from a real one, so
+// dev dismissals never write to preferences and re-enabling preview shows it
+// again.
+var previewBannerDismissed = false;
 
 // ============================================================================
 // STATE
 // ============================================================================
 
-// Copy presets from defaults (so we can modify it)
-var presets = Object.assign({}, DEFAULT_PRESETS);
+// Preset libraries, loaded (and migrated from the flat v1 store) on startup
+var presetModel = { libraries: [] };
+var selection = { libraryIndex: -1, presetIndex: -1 };
 
 // Current easing values
 var currentEasing = Object.assign({}, DEFAULT_EASING);
@@ -135,10 +145,16 @@ var speedDragHandle = null;
 var hoveredHandle = null;
 var speedHoveredHandle = null;
 
+// Update banner hover: the row reveals the dismiss X, download highlights
+var bannerRowHover = false;
+var bannerDownloadHover = false;
+
 // Window width below which the tab strip drops its labels and shows icons only
 var TAB_LABEL_MIN_WIDTH = 240;
 
 // Settings
+var updateCheckEnabled = loadUpdateCheckSetting();
+var presetLayout = "list";
 var applyOnDragEnabled = false;
 var clampHoldsEnabled = true;
 
@@ -171,9 +187,6 @@ var getButton = buildIconButton("get", "Get easing from keyframes");
 // Text input for cubic bezier values
 var bezierInput = new ui.LineEdit();
 bezierInput.setText("0.25, 0.1, 0.25, 1.0");
-
-// Preset dropdown
-var presetList = new ui.DropDown();
 
 // Context menu button for preset actions
 var presetContextButton = new ui.ImageButton(getAssetPath("icon-settings"));
@@ -210,8 +223,38 @@ var sharedState = {
     get hoveredHandle() { return hoveredHandle; },
     set hoveredHandle(v) { hoveredHandle = v; },
     get speedHoveredHandle() { return speedHoveredHandle; },
-    set speedHoveredHandle(v) { speedHoveredHandle = v; }
+    set speedHoveredHandle(v) { speedHoveredHandle = v; },
+    get bannerRowHover() { return bannerRowHover; },
+    set bannerRowHover(v) { bannerRowHover = v; },
+    get bannerDownloadHover() { return bannerDownloadHover; },
+    set bannerDownloadHover(v) { bannerDownloadHover = v; }
 };
+
+// The banner is only drawn on the graphs, never on the presets page.
+function isUpdateBannerVisible() {
+    if (previewUpdateBanner) return !previewBannerDismissed;
+    if (!updateAvailable) return false;
+
+    // Dismissal is remembered per version, so a later release shows the banner
+    // again rather than staying hidden forever.
+    return loadDismissedUpdate() !== latestVersion;
+}
+
+function openDownloadPage() {
+    api.openURL(DOWNLOAD_URL);
+}
+
+function dismissUpdateBanner() {
+    if (previewUpdateBanner) {
+        previewBannerDismissed = true;
+    } else if (latestVersion) {
+        saveDismissedUpdate(latestVersion);
+    }
+
+    bannerRowHover = false;
+    bannerDownloadHover = false;
+    redrawGraphs();
+}
 
 // Get current graph config
 function getGraphConfig() {
@@ -220,7 +263,10 @@ function getGraphConfig() {
         height: graphHeight,
         padding: graphPadding,
         handleRadius: handleRadius,
-        hoveredHandle: hoveredHandle
+        hoveredHandle: hoveredHandle,
+        updateAvailable: isUpdateBannerVisible(),
+        bannerRowHover: bannerRowHover,
+        bannerDownloadHover: bannerDownloadHover
     };
 }
 
@@ -230,7 +276,10 @@ function getSpeedGraphConfig() {
         height: speedGraphHeight,
         padding: speedGraphPadding,
         handleRadius: speedHandleRadius,
-        hoveredHandle: speedHoveredHandle
+        hoveredHandle: speedHoveredHandle,
+        updateAvailable: isUpdateBannerVisible(),
+        bannerRowHover: bannerRowHover,
+        bannerDownloadHover: bannerDownloadHover
     };
 }
 
@@ -301,7 +350,7 @@ setupValueGraphHandlers({
         redrawGraphs();
     },
     onDragEnd: function() {
-        presetList.setText("Select a preset...");
+        clearPresetSelection();
         if (applyOnDragEnabled) {
             applyEasingToKeyframes(currentEasing);
         }
@@ -311,7 +360,9 @@ setupValueGraphHandlers({
         // Only the hovered canvas needs repainting, and hover must not touch
         // the text input or trigger apply-on-drag the way onUpdate does.
         drawCurve(graphCanvas, currentEasing, getGraphConfig());
-    }
+    },
+    onUpdateBannerClick: openDownloadPage,
+    onUpdateBannerDismiss: dismissUpdateBanner
 });
 
 setupSpeedGraphHandlers({
@@ -326,86 +377,227 @@ setupSpeedGraphHandlers({
         }
     },
     onDragEnd: function() {
-        presetList.setText("Select a preset...");
+        clearPresetSelection();
         saveTabPreference();
     },
     onHoverChange: function() {
         drawSpeedCurve(speedGraphCanvas, currentEasing, speedEasing, getSpeedGraphConfig());
-    }
+    },
+    onUpdateBannerClick: openDownloadPage,
+    onUpdateBannerDismiss: dismissUpdateBanner
 });
 
 // ============================================================================
 // CONTEXT MENUS
 // ============================================================================
 
+// Editing the curve by hand means it no longer matches the selected preset.
+function clearPresetSelection() {
+    if (selection.libraryIndex === -1 && selection.presetIndex === -1) return;
+
+    selection.libraryIndex = -1;
+    selection.presetIndex = -1;
+    presetsPage.refresh();
+}
+
+// Persist the model and rebuild the presets page. Every mutation goes through
+// here: the page recreates its widgets from the model, so nothing may be cached
+// across a change.
+function commitPresetChange() {
+    saveLibraries(presetModel);
+    presetsPage.refresh();
+}
+
+function loadPresetIntoEditor(preset) {
+    currentEasing.x1 = preset.x1;
+    currentEasing.y1 = preset.y1;
+    currentEasing.x2 = preset.x2;
+    currentEasing.y2 = preset.y2;
+
+    updateTextInput();
+    redrawGraphs();
+}
+
+// Cavalry menus have no submenus, so choosing a library means replacing the
+// open menu with a second one listing them. With a single library there is
+// nothing to choose and the action runs directly.
+function chooseLibrary(title, onChosen, excludeIndex) {
+    var choices = [];
+
+    for (var i = 0; i < presetModel.libraries.length; i++) {
+        if (i !== excludeIndex) choices.push(i);
+    }
+
+    if (choices.length === 0) return;
+
+    if (choices.length === 1) {
+        onChosen(choices[0]);
+        return;
+    }
+
+    ui.clearContextMenu();
+    ui.addMenuItem({ name: title, enabled: false });
+    ui.addMenuItem({ name: "" });
+
+    choices.forEach(function(libraryIndex) {
+        ui.addMenuItem({
+            name: presetModel.libraries[libraryIndex].name,
+            onMouseRelease: function() {
+                onChosen(libraryIndex);
+            }
+        });
+    });
+
+    ui.showContextMenu();
+}
+
+// Menu shown by a preset row's "..." button
+function showPresetRowMenu(libraryIndex, presetIndex) {
+    var preset = presetModel.libraries[libraryIndex].presets[presetIndex];
+
+    ui.clearContextMenu();
+
+    ui.addMenuItem({
+        name: "Rename...",
+        onMouseRelease: function() {
+            if (renameLibraryPreset(presetModel, libraryIndex, presetIndex)) {
+                commitPresetChange();
+            }
+        }
+    });
+
+    ui.addMenuItem({
+        name: "Copy",
+        onMouseRelease: function() {
+            copyCubicBezierToClipboard(preset);
+        }
+    });
+
+    function moveTo(targetIndex) {
+        if (movePresetToLibrary(presetModel, libraryIndex, presetIndex, targetIndex)) {
+            clearPresetSelection();
+            commitPresetChange();
+        }
+    }
+
+    var otherLibraries = [];
+    for (var i = 0; i < presetModel.libraries.length; i++) {
+        if (i !== libraryIndex) otherLibraries.push(i);
+    }
+
+    if (otherLibraries.length === 1) {
+        // With one destination there is nothing to choose, so name it outright
+        // rather than implying a further step with an ellipsis.
+        var onlyTarget = otherLibraries[0];
+        ui.addMenuItem({
+            name: "Move to " + presetModel.libraries[onlyTarget].name,
+            onMouseRelease: function() {
+                moveTo(onlyTarget);
+            }
+        });
+    } else if (otherLibraries.length > 1) {
+        ui.addMenuItem({
+            name: "Move to...",
+            onMouseRelease: function() {
+                chooseLibrary("Move to library", moveTo, libraryIndex);
+            }
+        });
+    }
+
+    ui.addMenuItem({ name: "" });
+
+    ui.addMenuItem({
+        name: "Delete",
+        onMouseRelease: function() {
+            if (deleteLibraryPreset(presetModel, libraryIndex, presetIndex)) {
+                if (selection.libraryIndex === libraryIndex && selection.presetIndex === presetIndex) {
+                    selection.libraryIndex = -1;
+                    selection.presetIndex = -1;
+                }
+                commitPresetChange();
+            }
+        }
+    });
+
+    ui.showContextMenu();
+}
+
+// Menu shown by a library header's "..." button
+function showLibraryMenu(libraryIndex) {
+    ui.clearContextMenu();
+
+    ui.addMenuItem({
+        name: "Save Current Curve Here...",
+        onMouseRelease: function() {
+            if (savePresetToLibrary(presetModel, libraryIndex, currentEasing)) {
+                commitPresetChange();
+            }
+        }
+    });
+
+    ui.addMenuItem({ name: "" });
+
+    ui.addMenuItem({
+        name: "Rename...",
+        onMouseRelease: function() {
+            if (renameLibrary(presetModel, libraryIndex)) {
+                commitPresetChange();
+            }
+        }
+    });
+
+    ui.addMenuItem({
+        name: "Export Library...",
+        onMouseRelease: function() {
+            exportLibrary(presetModel, libraryIndex);
+        }
+    });
+
+    ui.addMenuItem({
+        name: "Delete",
+        onMouseRelease: function() {
+            if (deleteLibrary(presetModel, libraryIndex)) {
+                selection.libraryIndex = -1;
+                selection.presetIndex = -1;
+                commitPresetChange();
+            }
+        }
+    });
+
+    ui.showContextMenu();
+}
+
 function showPresetContextMenu() {
     ui.clearContextMenu();
 
     var separatorItem = { name: "" };
-    
+
     ui.addMenuItem({
         name: "Save Preset...",
         onMouseRelease: function() {
-            savePreset(presets, currentEasing, function() {
-                populatePresetDropdown(presetList, presets);
-                savePresetsToPreferences(presets);
+            chooseLibrary("Save to library", function(libraryIndex) {
+                if (savePresetToLibrary(presetModel, libraryIndex, currentEasing)) {
+                    commitPresetChange();
+                }
             });
         }
     });
-    
-    ui.addMenuItem(separatorItem);
-    
+
     ui.addMenuItem({
-        name: "Rename Preset",
+        name: "New Library...",
         onMouseRelease: function() {
-            var selectedPreset = presetList.getText();
-            var newName = renamePreset(presets, selectedPreset, function() {
-                populatePresetDropdown(presetList, presets);
-                savePresetsToPreferences(presets);
-            });
-            if (newName) {
-                presetList.setText(newName);
+            if (createLibrary(presetModel)) {
+                commitPresetChange();
             }
         }
     });
-    
-    ui.addMenuItem({
-        name: "Delete Preset",
-        onMouseRelease: function() {
-            var selectedPreset = presetList.getText();
-            deletePreset(presets, selectedPreset, function() {
-                populatePresetDropdown(presetList, presets);
-                savePresetsToPreferences(presets);
-            });
-        }
-    });
-    
-    ui.addMenuItem(separatorItem);
 
     ui.addMenuItem({
-        name: "Import Presets",
+        name: "Import Library...",
         onMouseRelease: function() {
-            importPresets(presets, function() {
-                savePresetsToPreferences(presets);
-                populatePresetDropdown(presetList, presets);
-            });
-        }
-    });
-    
-    ui.addMenuItem({
-        name: "Copy All Presets",
-        onMouseRelease: function() {
-            exportPresets(presets);
-        }
-    });
-    
-    ui.addMenuItem({
-        name: "Delete All Presets",
-        onMouseRelease: function() {
-            deleteAllPresets(presets, function() {
-                populatePresetDropdown(presetList, presets);
-                savePresetsToPreferences(presets);
-            });
+            if (importLibrary(presetModel)) {
+                commitPresetChange();
+            }
         }
     });
 
@@ -441,6 +633,24 @@ function showPresetContextMenu() {
 
     ui.addMenuItem(separatorItem);
     
+    ui.addMenuItem({ name: "Preset layout", enabled: false });
+
+    ["list", "grid"].forEach(function(layout) {
+        ui.addMenuItem({
+            name: "    " + (layout === "list" ? "List" : "Grid") +
+                  (presetLayout === layout ? " ✓" : ""),
+            onMouseRelease: function() {
+                if (presetLayout === layout) return;
+
+                presetLayout = layout;
+                savePresetLayoutSetting(layout);
+                presetsPage.refresh();
+            }
+        });
+    });
+
+    ui.addMenuItem(separatorItem);
+
     ui.addMenuItem({
         name: "Apply when dragging handles" + (applyOnDragEnabled ? " ✓" : ""),
         onMouseRelease: function() {
@@ -472,6 +682,21 @@ function showPresetContextMenu() {
         name: "Clamp motion paths between holds",
         onMouseRelease: function() {
             fixHoldPaths();
+        }
+    });
+
+    ui.addMenuItem(separatorItem);
+
+    // Demo aid: forces the update banner on so it can be seen without waiting
+    // for a release to exist. Remove before shipping.
+    ui.addMenuItem({
+        name: "Preview update banner" + (previewUpdateBanner ? " ✓" : ""),
+        onMouseRelease: function() {
+            previewUpdateBanner = !previewUpdateBanner;
+            // Re-enabling always shows the banner again, however it was last
+            // dismissed.
+            previewBannerDismissed = false;
+            redrawGraphs();
         }
     });
 
@@ -526,29 +751,7 @@ bezierInput.onValueChanged = function() {
     updateFromTextInput();
     
     if (!isUpdatingFromPreset) {
-        presetList.setText("Select a preset...");
-    }
-};
-
-presetList.onValueChanged = function() {
-    var selectedPreset = presetList.getText();
-    
-    if (selectedPreset === "Select a preset...") return;
-    
-    if (selectedPreset && presets[selectedPreset]) {
-        isUpdatingFromPreset = true;
-        var preset = presets[selectedPreset];
-        
-        currentEasing.x1 = preset.x1;
-        currentEasing.y1 = preset.y1;
-        currentEasing.x2 = preset.x2;
-        currentEasing.y2 = preset.y2;
-        
-        updateTextInput();
-        redrawGraphs();
-        isUpdatingFromPreset = false;
-        
-        saveTabPreference();
+        clearPresetSelection();
     }
 };
 
@@ -556,8 +759,20 @@ presetList.onValueChanged = function() {
 // INITIALIZATION
 // ============================================================================
 
-// Load saved presets
-loadPresetsFromPreferences(presets);
+// Load preset libraries, migrating the flat v1 store on first run
+presetModel = loadLibraries();
+
+// Check for updates (unless the user turned it off)
+if (updateCheckEnabled) {
+    checkForUpdate(GITHUB_REPO, scriptName, currentVersion, function(available, newVersion) {
+        updateAvailable = available;
+        latestVersion = newVersion || null;
+        if (available) redrawGraphs();
+    });
+}
+
+// Load presets page layout
+presetLayout = loadPresetLayoutSetting();
 
 // Load apply on drag setting
 applyOnDragEnabled = loadApplyOnDragSetting();
@@ -565,9 +780,6 @@ applyOnDragEnabled = loadApplyOnDragSetting();
 // Load clamp holds setting
 clampHoldsEnabled = loadClampIdenticalSetting();
 setClampHoldsEnabled(clampHoldsEnabled);
-
-// Populate preset dropdown
-populatePresetDropdown(presetList, presets);
 
 // ============================================================================
 // UI LAYOUT
@@ -578,16 +790,11 @@ var mainLayout = new ui.VLayout();
 mainLayout.setSpaceBetween(0);
 mainLayout.setMargins(3, 3, 3, 3);
 
-// Preset row. The dropdown goes away in favour of the Presets page; until then
-// it keeps its own row, with the gear moved up into the bottom bar row.
-var presetRow = new ui.HLayout();
-presetRow.add(presetList);
-presetRow.setMargins(0, 4, 0, 0);
-
 // VALUE PAGE
 var valueTabLayout = new ui.VLayout();
 valueTabLayout.setSpaceBetween(0);
 valueTabLayout.setMargins(0, 0, 0, 0);
+valueTabLayout.addStretch();
 valueTabLayout.add(graphCanvas);
 valueTabLayout.addStretch();
 
@@ -595,18 +802,53 @@ valueTabLayout.addStretch();
 var speedTabLayout = new ui.VLayout();
 speedTabLayout.setSpaceBetween(0);
 speedTabLayout.setMargins(0, 0, 0, 0);
+speedTabLayout.addStretch();
 speedTabLayout.add(speedGraphCanvas);
 speedTabLayout.addStretch();
+
+// PRESETS PAGE
+var presetsPage = createPresetsPage({
+    getModel: function() {
+        return presetModel;
+    },
+    getSelection: function() {
+        return selection;
+    },
+    onSelect: function(libraryIndex, presetIndex, preset) {
+        selection.libraryIndex = libraryIndex;
+        selection.presetIndex = presetIndex;
+
+        // Guards the text field's onValueChanged from clearing the selection
+        // we just made.
+        isUpdatingFromPreset = true;
+        loadPresetIntoEditor(preset);
+        isUpdatingFromPreset = false;
+
+        presetsPage.refresh();
+
+        // Apply straight away. This logs and no-ops when no keyframes are
+        // selected, so it is safe on every click.
+        applyEasingToKeyframes(currentEasing);
+        saveTabPreference();
+    },
+    getLayout: function() {
+        return presetLayout;
+    },
+    onLibraryMenu: showLibraryMenu,
+    onPresetMenu: showPresetRowMenu
+});
 
 // PageView rather than TabView: TabView's chrome cannot be styled at all, so
 // the tab strip above is built by hand and drives the pages directly.
 var pageView = new ui.PageView();
 pageView.add(valueTabLayout);
 pageView.add(speedTabLayout);
+pageView.add(presetsPage.widget);
 
 var tabStrip = buildTabStrip([
     { label: "Value", icon: "value" },
-    { label: "Speed", icon: "speed" }
+    { label: "Speed", icon: "speed" },
+    { label: "Presets", icon: "presets" }
 ], function(index) {
     pageView.setPage(index);
     redrawGraphs();
@@ -624,8 +866,6 @@ buttonRow.add(presetContextButton);
 buttonRow.setSpaceBetween(7);
 buttonRow.setMargins(0, 4, 0, 0);
 mainLayout.add(buttonRow);
-mainLayout.add(presetRow);
-mainLayout.addStretch();
 
 // Add to UI
 ui.add(mainLayout);
@@ -634,6 +874,7 @@ ui.setBackgroundColor(ui.getThemeColor("Base"));
 // Initialize display
 updateTextInput();
 redrawGraphs();
+presetsPage.refresh();
 
 // PageView has no onPageChanged callback; the tab strip's onSelect above is
 // the only way pages change, and it already redraws and saves.
@@ -647,18 +888,31 @@ ui.onResize = function() {
     var newWidth = ui.size().width;
     var newHeight = ui.size().height;
     
-    // Tab strip (29) + bottom bar row (33) + preset row + window margins. Must
-    // over- rather than under-estimate: too small and the window grows a
-    // scrollbar, which overlaps the controls.
-    var controlsHeight = 115;
-    var margin = 6;
+    // Tab strip (31) + bottom bar row (33) + window margins. Must over- rather
+    // than under-estimate: too small and the window grows a scrollbar, which
+    // overlaps the controls.
+    var controlsHeight = 90;
+    // Must comfortably exceed the main layout's own left+right margins. Sizing
+    // the canvas to the full width leaves the layout no slack, so the canvas
+    // asks for more room than the content area has, the window grows to fit,
+    // and the next resize reads the larger size — the window then ratchets
+    // wider on every resize or tab change.
+    var margin = 14;
 
     // Below this the labels no longer fit beside the icons.
     tabStrip.setCompact(newWidth < TAB_LABEL_MIN_WIDTH);
-    
+
+    // Ahead of the early-out below, since the grid has to react to a width
+    // change even when the graph's size is unchanged.
+    presetsPage.setAvailableWidth(newWidth - margin);
+
     var newGraphWidth = Math.max(150, newWidth - margin);
     var newGraphHeight = Math.max(150, newHeight - controlsHeight);
-    
+
+    // Re-applying an unchanged size is what turns any sizing feedback into a
+    // runaway loop, so bail out when nothing actually moved.
+    if (newGraphWidth === graphWidth && newGraphHeight === graphHeight) return;
+
     graphWidth = newGraphWidth;
     graphHeight = newGraphHeight;
     speedGraphWidth = newGraphWidth;

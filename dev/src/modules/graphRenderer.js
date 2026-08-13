@@ -38,6 +38,10 @@ var RING_WIDTH = 2;
 // How much a handle grows while the cursor is over it.
 var HOVER_GROW = 1.5;
 
+// Grid tile geometry, traced from the design's 48px tile. The curve inset
+// scales with the tile so larger tiles keep the same proportions.
+var TILE_PADDING_RATIO = 7 / 48;
+
 function shadowColor(plotBg, mix) {
     return blend(plotBg, "#000000", mix);
 }
@@ -84,6 +88,267 @@ function drawHandle(canvas, x, y, radius, tokens) {
         "color": tokens.text,
         "stroke": true,
         "strokeWidth": RING_WIDTH
+    });
+}
+
+/**
+ * Draw a preset's curve at row-icon scale: no grid, handles or shadow.
+ * Drawn live from the preset rather than shipped as an image, so it always
+ * matches the stored easing and follows the theme.
+ * @param {Object} canvas - The ui.Draw canvas element
+ * @param {Object} easing - {x1, y1, x2, y2}
+ * @param {number} size - Canvas edge length in px
+ * @param {string} color - Curve colour, hex string
+ */
+export function drawCurveThumbnail(canvas, easing, size, color) {
+    canvas.clearPaths();
+
+    var padding = 3;
+    var low = padding;
+    var high = size - padding;
+    var span = high - low;
+
+    // ui.Draw is y-up, so `low` is the bottom edge and the curve runs from
+    // bottom-left to top-right, matching the main graph.
+    var path = new cavalry.Path();
+    path.moveTo(low, low);
+    path.cubicTo(
+        low + easing.x1 * span, low + easing.y1 * span,
+        low + easing.x2 * span, low + easing.y2 * span,
+        high, high
+    );
+
+    canvas.addPath(path.toObject(), {
+        "color": color,
+        "stroke": true,
+        "strokeWidth": 1.5
+    });
+
+    canvas.redraw();
+}
+
+/**
+ * Draw a preset tile for the grid layout.
+ * Tiles carry no menu affordance — right-click opens the menu — because a
+ * drawn-in pill cannot be a real widget (Cavalry layouts have no z-stacking)
+ * and hit-testing it was more fragile than it was worth.
+ *
+ * @param {Object} canvas - The ui.Draw canvas element
+ * @param {Object} easing - {x1, y1, x2, y2}
+ * @param {number} size - Tile edge length in px
+ * @param {Object} tokens - Theme tokens
+ */
+export function drawPresetTile(canvas, easing, size, tokens) {
+    canvas.clearPaths();
+
+    var padding = size * TILE_PADDING_RATIO;
+    var low = padding;
+    var high = size - padding;
+    var span = high - low;
+
+    var path = new cavalry.Path();
+    path.moveTo(low, low);
+    path.cubicTo(
+        low + easing.x1 * span, low + easing.y1 * span,
+        low + easing.x2 * span, low + easing.y2 * span,
+        high, high
+    );
+    canvas.addPath(path.toObject(), {
+        "color": tokens.text,
+        "stroke": true,
+        "strokeWidth": 1.5
+    });
+
+    canvas.redraw();
+}
+
+var BANNER_MARGIN = 4;
+var BANNER_TEXT_SIZE = 12;
+var BANNER_BASELINE = 2;
+var BANNER_ICON_SIZE = 13;
+// The heart is drawn from a 13.3 x 11.7 trace, which overhangs 12px text whose
+// caps are only ~8.5px tall. Scaled down and centred on the cap height rather
+// than sitting on the baseline like the text does.
+var BANNER_ICON_SCALE = 0.9;
+var BANNER_CAP_HEIGHT = 8.5;
+// Padding around the two hit targets, so they are comfortable to click without
+// making the whole strip swallow clicks meant for the graph.
+var BANNER_HIT_PADDING = 4;
+
+/**
+ * Mirror a path builder's Y axis. Traced SVG coordinates are y-down; ui.Draw
+ * is y-up.
+ */
+function flipY(path, height, scale) {
+    var s = scale || 1;
+
+    return {
+        moveTo: function(x, y) {
+            path.moveTo(x * s, (height - y) * s);
+        },
+        lineTo: function(x, y) {
+            path.lineTo(x * s, (height - y) * s);
+        },
+        cubicTo: function(x1, y1, x2, y2, x, y) {
+            path.cubicTo(x1 * s, (height - y1) * s, x2 * s, (height - y2) * s, x * s, (height - y) * s);
+        },
+        close: function() {
+            path.close();
+        }
+    };
+}
+
+/**
+ * The banner's two hit targets, in the canvas's y-up coordinates.
+ *
+ * Only these areas are clickable — the rest of the strip stays available to the
+ * graph beneath. The download width is measured from the real text path rather
+ * than estimated, so the target always matches what is drawn.
+ *
+ * @param {number} width - Canvas width
+ * @returns {Object} {dismiss, download} each {left, right, bottom, top}
+ */
+export function updateBannerRegions(width) {
+    var measure = new cavalry.Path();
+    measure.addText("Download", BANNER_TEXT_SIZE, 0, 0);
+    var textWidth = measure.boundingBox().width;
+
+    var bottom = 0;
+    var top = BANNER_BASELINE + BANNER_TEXT_SIZE + BANNER_HIT_PADDING;
+
+    return {
+        // The whole strip, used only for hover — it reveals the dismiss X. It
+        // is deliberately not a click target, so clicks elsewhere still reach
+        // the graph.
+        row: {
+            left: 0,
+            right: width,
+            bottom: bottom,
+            top: top
+        },
+        dismiss: {
+            left: BANNER_MARGIN - BANNER_HIT_PADDING,
+            right: BANNER_MARGIN + BANNER_ICON_SIZE + BANNER_HIT_PADDING,
+            bottom: bottom,
+            top: top
+        },
+        download: {
+            left: width - BANNER_MARGIN - textWidth - BANNER_HIT_PADDING,
+            right: width - BANNER_MARGIN + BANNER_HIT_PADDING,
+            bottom: bottom,
+            top: top
+        },
+        textWidth: textWidth
+    };
+}
+
+/**
+ * Whether a position falls inside one of the banner's named regions.
+ * @param {Object} regions - From updateBannerRegions
+ * @param {string} name - Region key, e.g. "row" or "download"
+ * @param {Object} position - {x, y} in canvas coordinates
+ * @returns {boolean}
+ */
+export function updateBannerContains(regions, name, position) {
+    return contains(regions[name], position);
+}
+
+function contains(region, position) {
+    return position.x >= region.left && position.x <= region.right &&
+           position.y >= region.bottom && position.y <= region.top;
+}
+
+/**
+ * Which part of the banner a click landed on, if any.
+ *
+ * Mouse positions share the canvas's y-up space — the same space the handle
+ * hit-testing uses — so the banner along the bottom edge is at *low* y.
+ *
+ * @param {Object} position - {x, y} in canvas coordinates
+ * @param {number} width - Canvas width
+ * @returns {string|null} "dismiss", "download", or null
+ */
+export function updateBannerHit(position, width) {
+    var regions = updateBannerRegions(width);
+
+    if (contains(regions.dismiss, position)) return "dismiss";
+    if (contains(regions.download, position)) return "download";
+
+    return null;
+}
+
+/**
+ * Draw the "New update!" banner along the bottom of a graph.
+ *
+ * Painted into the graph canvas rather than added as a widget so it overlays
+ * the graph instead of taking layout space, as the design intends.
+ *
+ * @param {Object} canvas - The ui.Draw canvas element
+ * @param {number} width - Canvas width
+ * @param {Object} tokens - Theme tokens
+ * @param {boolean} rowHovered - Show the dismiss X in place of the heart
+ * @param {boolean} downloadHovered - Emphasise the download link
+ */
+function drawUpdateBanner(canvas, width, tokens, rowHovered, downloadHovered) {
+    var paint = { "color": tokens.textMuted, "stroke": false };
+    var regions = updateBannerRegions(width);
+    var baseline = BANNER_BASELINE;
+
+    if (rowHovered) {
+        // An X in place of the heart, so the banner can be dismissed when it
+        // sits over part of the curve.
+        var cross = new cavalry.Path();
+        var crossSize = 9;
+        var low = baseline + (BANNER_CAP_HEIGHT - crossSize) / 2;
+        var high = low + crossSize;
+        var left = BANNER_MARGIN + 1;
+        var right = left + crossSize;
+
+        cross.moveTo(left, low);
+        cross.lineTo(right, high);
+        cross.moveTo(left, high);
+        cross.lineTo(right, low);
+
+        canvas.addPath(cross.toObject(), {
+            "color": tokens.text,
+            "stroke": true,
+            "strokeWidth": 1.5
+        });
+    } else {
+        var heart = new cavalry.Path();
+        var h = flipY(heart, 11.684, BANNER_ICON_SCALE);
+        h.moveTo(9.974, 0);
+        h.cubicTo(11.831, 0, 13.336, 1.771, 13.337, 3.956);
+        h.cubicTo(13.337, 6.680, 9.643, 9.863, 7.754, 11.312);
+        h.cubicTo(7.108, 11.808, 6.228, 11.808, 5.582, 11.312);
+        h.cubicTo(3.693, 9.862, 0, 6.680, 0, 3.956);
+        h.cubicTo(0, 1.771, 1.505, 0, 3.362, 0);
+        h.cubicTo(5.011, 0, 6.381, 1.397, 6.668, 3.239);
+        h.cubicTo(6.955, 1.397, 8.326, 0, 9.974, 0);
+        h.close();
+        // Centre the glyph on the text's cap height.
+        var heartHeight = 11.684 * BANNER_ICON_SCALE;
+        heart.translate(BANNER_MARGIN, baseline + (BANNER_CAP_HEIGHT - heartHeight) / 2);
+        canvas.addPath(heart.toObject(), paint);
+    }
+
+    var label = new cavalry.Path();
+    label.addText("New update!", BANNER_TEXT_SIZE, BANNER_MARGIN + 18, baseline);
+    canvas.addPath(label.toObject(), paint);
+
+    var downloadPath = new cavalry.Path();
+    downloadPath.addText("Download", BANNER_TEXT_SIZE, 0, baseline);
+    downloadPath.translate(width - BANNER_MARGIN - regions.textWidth, 0);
+
+    // addText has no weight, so bold is faked by stroking the glyphs on top of
+    // their own fill. Hover brightens it to the full text colour.
+    var downloadColor = downloadHovered ? tokens.text : tokens.textMuted;
+    var downloadShape = downloadPath.toObject();
+    canvas.addPath(downloadShape, { "color": downloadColor, "stroke": false });
+    canvas.addPath(downloadShape, {
+        "color": downloadColor,
+        "stroke": true,
+        "strokeWidth": downloadHovered ? 1 : 0.7
     });
 }
 
@@ -195,6 +460,10 @@ export function drawCurve(canvas, currentEasing, config) {
     drawHandle(canvas, visibleCp1X, visibleCp1Y, hoverRadius('cp1', config.hoveredHandle, handleRadius), tokens);
     drawHandle(canvas, visibleCp2X, visibleCp2Y, hoverRadius('cp2', config.hoveredHandle, handleRadius), tokens);
 
+    if (config.updateAvailable) {
+        drawUpdateBanner(canvas, width, tokens, config.bannerRowHover, config.bannerDownloadHover);
+    }
+
     // Trigger redraw
     canvas.redraw();
 }
@@ -294,6 +563,10 @@ export function drawSpeedCurve(canvas, currentEasing, speedEasing, config) {
     // Draw handles
     drawHandle(canvas, outHandleX, outHandleY, hoverRadius('out', config.hoveredHandle, handleRadius), tokens);
     drawHandle(canvas, inHandleX, inHandleY, hoverRadius('in', config.hoveredHandle, handleRadius), tokens);
+
+    if (config.updateAvailable) {
+        drawUpdateBanner(canvas, width, tokens, config.bannerRowHover, config.bannerDownloadHover);
+    }
 
     canvas.redraw();
 }

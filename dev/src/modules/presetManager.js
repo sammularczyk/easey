@@ -1,215 +1,309 @@
 // Preset management module
 // Functions for saving, loading, and managing easing presets
 
+import { DEFAULT_PRESETS } from './constants.js';
+
+// ============================================================================
+// PRESET LIBRARIES
+//
+// Model: { libraries: [ { name, presets: [ {name, x1, y1, x2, y2} ] } ] }
+//
+// Ordered arrays rather than keyed objects, because libraries and presets are
+// user-orderable and names are allowed to repeat. Entries are addressed by
+// index and carry no id: the presets page is rebuilt from the model after every
+// mutation, so an index is never held across a change.
+// ============================================================================
+
+var LIBRARIES_KEY = "easey_presets_v2";
+var LEGACY_PRESETS_KEY = "easey_presets";
+var DEFAULT_LIBRARY_NAME = "My Presets";
+var MAX_NAME_LENGTH = 30;
+
 /**
- * Save a new preset
- * @param {Object} presets - Presets object to modify
- * @param {Object} currentEasing - Current easing values to save
- * @param {Function} onSave - Callback after saving (for updating UI)
+ * Wrap a flat {name: {x1,y1,x2,y2}} map into a single-library model.
+ * @param {Object} flatPresets - Legacy preset map
+ * @param {string} libraryName - Name for the wrapping library
+ * @returns {Object} A libraries model
  */
-export function savePreset(presets, currentEasing, onSave) {
+export function buildLibrariesFromFlat(flatPresets, libraryName) {
+    var names = Object.keys(flatPresets || {}).sort(function(a, b) {
+        return a.toLowerCase().localeCompare(b.toLowerCase());
+    });
+
+    var presets = names.map(function(name) {
+        var preset = flatPresets[name];
+        return {
+            name: name,
+            x1: preset.x1,
+            y1: preset.y1,
+            x2: preset.x2,
+            y2: preset.y2
+        };
+    });
+
+    return { libraries: [{ name: libraryName, presets: presets }] };
+}
+
+function isFiniteNumber(value) {
+    return typeof value === "number" && isFinite(value);
+}
+
+/**
+ * Coerce a value read back from preferences into a valid model, dropping
+ * anything malformed. Preferences are user-editable on disk, so a corrupt or
+ * hand-edited blob must not take the whole panel down.
+ * @param {Object} raw - Value from preferences
+ * @returns {Object|null} A libraries model, or null if unusable
+ */
+export function normaliseLibraries(raw) {
+    if (!raw || !Array.isArray(raw.libraries)) return null;
+
+    var libraries = [];
+
+    for (var i = 0; i < raw.libraries.length; i++) {
+        var library = raw.libraries[i];
+        if (!library || typeof library.name !== "string") continue;
+
+        var presets = [];
+        var rawPresets = Array.isArray(library.presets) ? library.presets : [];
+
+        for (var j = 0; j < rawPresets.length; j++) {
+            var preset = rawPresets[j];
+            if (!preset || typeof preset.name !== "string") continue;
+            if (!isFiniteNumber(preset.x1) || !isFiniteNumber(preset.y1)) continue;
+            if (!isFiniteNumber(preset.x2) || !isFiniteNumber(preset.y2)) continue;
+
+            presets.push({
+                name: preset.name,
+                x1: preset.x1,
+                y1: preset.y1,
+                x2: preset.x2,
+                y2: preset.y2
+            });
+        }
+
+        libraries.push({ name: library.name, presets: presets });
+    }
+
+    return libraries.length > 0 ? { libraries: libraries } : null;
+}
+
+/**
+ * Load the libraries model, migrating older storage where needed.
+ * The legacy key is deliberately left in place so an older Easey still opens.
+ * @returns {Object} A libraries model
+ */
+export function loadLibraries() {
     try {
-        var modal = new ui.Modal();
-        var presetName = modal.showStringInput("Save Preset", "Enter preset name (max 30 chars):", "My Preset");
-        
-        if (presetName && presetName.trim() !== "") {
-            if (presetName.length > 30) {
-                console.log("Preset name too long. Please use 30 characters or less.");
-                return;
+        if (api.hasPreferenceObject(LIBRARIES_KEY)) {
+            var saved = normaliseLibraries(api.getPreferenceObject(LIBRARIES_KEY));
+            if (saved) return saved;
+        }
+
+        if (api.hasPreferenceObject(LEGACY_PRESETS_KEY)) {
+            var legacy = api.getPreferenceObject(LEGACY_PRESETS_KEY);
+            if (legacy && Object.keys(legacy).length > 0) {
+                return buildLibrariesFromFlat(legacy, DEFAULT_LIBRARY_NAME);
             }
-            
-            presets[presetName] = {
-                x1: currentEasing.x1,
-                y1: currentEasing.y1,
-                x2: currentEasing.x2,
-                y2: currentEasing.y2
-            };
-            
-            if (onSave) onSave();
         }
     } catch (e) {
-        console.log("Error saving preset:", e.message);
+        console.log("Could not load preset libraries:", e.message);
+    }
+
+    return buildLibrariesFromFlat(DEFAULT_PRESETS, DEFAULT_LIBRARY_NAME);
+}
+
+/**
+ * Persist the libraries model.
+ * @param {Object} model - A libraries model
+ */
+export function saveLibraries(model) {
+    try {
+        api.setPreferenceObject(LIBRARIES_KEY, model);
+    } catch (e) {
+        console.log("Could not save preset libraries:", e.message);
     }
 }
 
 /**
- * Rename an existing preset
- * @param {Object} presets - Presets object to modify
- * @param {string} selectedPreset - Name of preset to rename
- * @param {Function} onRename - Callback after renaming (for updating UI)
- * @returns {string|null} New preset name or null if cancelled
+ * Prompt for a name, rejecting empty and over-long input.
+ * @returns {string|null} Trimmed name, or null when cancelled or invalid
  */
-export function renamePreset(presets, selectedPreset, onRename) {
-    if (!selectedPreset || selectedPreset === "Select a preset..." || selectedPreset === "---") {
-        console.log("Please select a preset to rename");
+function promptForName(title, message, initial) {
+    var modal = new ui.Modal();
+    var name = modal.showStringInput(title, message, initial);
+
+    if (!name) return null;
+
+    // Trim before measuring, so surrounding whitespace can't push an otherwise
+    // acceptable name over the limit.
+    var trimmed = name.trim();
+    if (trimmed === "") return null;
+
+    if (trimmed.length > MAX_NAME_LENGTH) {
+        // A console line would leave the user staring at a menu that silently
+        // did nothing.
+        new ui.Modal().showMessage(
+            title,
+            "That name is " + trimmed.length + " characters. Please use " +
+            MAX_NAME_LENGTH + " or less."
+        );
         return null;
     }
-    
-    try {
-        var modal = new ui.Modal();
-        var newName = modal.showStringInput("Rename Preset", "Enter new name (max 30 chars):", selectedPreset);
-        
-        if (newName && newName.trim() !== "" && newName !== selectedPreset) {
-            if (newName.length > 30) {
-                console.log("Preset name too long. Please use 30 characters or less.");
-                return null;
-            }
-            
-            if (presets[newName]) {
-                console.log("A preset with that name already exists");
-                return null;
-            }
-            
-            presets[newName] = presets[selectedPreset];
-            delete presets[selectedPreset];
-            
-            if (onRename) onRename();
-            
-            return newName;
-        }
-    } catch (e) {
-        console.log("Error renaming preset:", e.message);
-    }
-    
-    return null;
+
+    return trimmed;
+}
+
+function getLibrary(model, libraryIndex) {
+    return model.libraries[libraryIndex] || null;
 }
 
 /**
- * Delete a preset
- * @param {Object} presets - Presets object to modify
- * @param {string} selectedPreset - Name of preset to delete
- * @param {Function} onDelete - Callback after deleting (for updating UI)
+ * @returns {boolean} Whether the model changed
  */
-export function deletePreset(presets, selectedPreset, onDelete) {
-    if (!selectedPreset || selectedPreset === "Select a preset..." || selectedPreset === "---") {
-        console.log("Please select a preset to delete");
-        return;
+export function createLibrary(model) {
+    var name = promptForName("New Library", "Enter library name (max 30 chars):", "My Library");
+    if (!name) return false;
+
+    model.libraries.push({ name: name, presets: [] });
+    return true;
+}
+
+export function renameLibrary(model, libraryIndex) {
+    var library = getLibrary(model, libraryIndex);
+    if (!library) return false;
+
+    var name = promptForName("Rename Library", "Enter new name (max 30 chars):", library.name);
+    if (!name || name === library.name) return false;
+
+    library.name = name;
+    return true;
+}
+
+export function deleteLibrary(model, libraryIndex) {
+    var library = getLibrary(model, libraryIndex);
+    if (!library) return false;
+
+    // Deleting the last library would leave nowhere to save a preset.
+    if (model.libraries.length === 1) {
+        console.log("Cannot delete the only library.");
+        return false;
     }
-    
-    try {
-        delete presets[selectedPreset];
-        if (onDelete) onDelete();
-    } catch (e) {
-        console.log("Error deleting preset:", e.message);
-    }
+
+    var modal = new ui.Modal();
+    var confirmText = "Delete \"" + library.name + "\" and its " + library.presets.length +
+        " preset(s)?\n\nThis action cannot be undone.";
+
+    if (!modal.showConfirmation("Delete Library", confirmText)) return false;
+
+    model.libraries.splice(libraryIndex, 1);
+    return true;
 }
 
 /**
- * Delete all presets
- * @param {Object} presets - Presets object to clear
- * @param {Function} onDelete - Callback after deleting (for updating UI)
+ * Write a library to a JSON file of the user's choosing.
  */
-export function deleteAllPresets(presets, onDelete) {
+export function exportLibrary(model, libraryIndex) {
+    var library = getLibrary(model, libraryIndex);
+    if (!library) return;
+
     try {
-        var allPresetNames = Object.keys(presets);
-        
-        if (allPresetNames.length === 0) {
-            console.log("No presets to delete");
-            return;
-        }
-        
-        var modal = new ui.Modal();
-        var confirmText = "Are you sure you want to delete ALL " + allPresetNames.length + " presets?\n\nThis action cannot be undone.";
-        var result = modal.showConfirmation("Delete All Presets", confirmText);
-        
-        if (result) {
-            for (var presetName in presets) {
-                delete presets[presetName];
-            }
-            
-            if (onDelete) onDelete();
-            console.log("Deleted all " + allPresetNames.length + " presets");
-        }
-        
+        var path = ui.chooseFileToSave(library.name + ".json", "Easey Library (*.json)");
+        if (!path) return;
+
+        api.writeToFile(path, JSON.stringify(library, null, 2), true);
+        console.log("Exported \"" + library.name + "\" to " + path);
     } catch (e) {
-        console.log("Error deleting all presets:", e.message);
+        console.log("Error exporting library:", e.message);
     }
 }
 
 /**
- * Export presets to clipboard as JSON
- * @param {Object} presets - Presets object to export
+ * Append a library read from a JSON file. Accepts either a single exported
+ * library or a whole exported model.
+ * @returns {boolean} Whether the model changed
  */
-export function exportPresets(presets) {
+export function importLibrary(model) {
     try {
-        var presetsJson = JSON.stringify(presets, null, 2);
-        api.setClipboardText(presetsJson);
+        var path = ui.chooseFileToOpen("", "Easey Library (*.json)");
+        if (!path) return false;
+
+        var parsed = JSON.parse(api.readFromFile(path));
+        var imported = normaliseLibraries(parsed.libraries ? parsed : { libraries: [parsed] });
+
+        if (!imported) {
+            console.log("That file does not contain any valid presets.");
+            return false;
+        }
+
+        for (var i = 0; i < imported.libraries.length; i++) {
+            model.libraries.push(imported.libraries[i]);
+        }
+
+        return true;
     } catch (e) {
-        console.log("Error exporting presets:", e.message);
+        console.log("Error importing library:", e.message);
+        return false;
     }
 }
 
-/**
- * Import presets from clipboard JSON
- * @param {Object} presets - Presets object to modify
- * @param {Function} onImport - Callback after importing (for updating UI)
- */
-export function importPresets(presets, onImport) {
-    try {
-        var clipboardContent = api.getClipboardText();
-        if (!clipboardContent) {
-            console.log("No content in clipboard");
-            return;
-        }
-        
-        var importedPresets;
-        try {
-            importedPresets = JSON.parse(clipboardContent);
-        } catch (e) {
-            console.log("Clipboard content is not valid JSON");
-            return;
-        }
-        
-        if (typeof importedPresets !== 'object' || importedPresets === null) {
-            console.log("Clipboard content is not a valid presets object");
-            return;
-        }
-        
-        // Merge presets
-        for (var name in importedPresets) {
-            presets[name] = importedPresets[name];
-        }
-        
-        if (onImport) onImport();
-        
-    } catch (e) {
-        console.log("Error importing presets:", e.message);
-    }
+export function savePresetToLibrary(model, libraryIndex, currentEasing) {
+    var library = getLibrary(model, libraryIndex);
+    if (!library) return false;
+
+    var name = promptForName("Save Preset", "Enter preset name (max 30 chars):", "My Preset");
+    if (!name) return false;
+
+    library.presets.push({
+        name: name,
+        x1: currentEasing.x1,
+        y1: currentEasing.y1,
+        x2: currentEasing.x2,
+        y2: currentEasing.y2
+    });
+
+    return true;
+}
+
+export function renameLibraryPreset(model, libraryIndex, presetIndex) {
+    var library = getLibrary(model, libraryIndex);
+    if (!library || !library.presets[presetIndex]) return false;
+
+    var preset = library.presets[presetIndex];
+    var name = promptForName("Rename Preset", "Enter new name (max 30 chars):", preset.name);
+    if (!name || name === preset.name) return false;
+
+    preset.name = name;
+    return true;
 }
 
 /**
- * Save presets to preferences
- * @param {Object} presets - Presets object to save
+ * Move a preset into another library, appending it at the end.
+ * @returns {boolean} Whether the model changed
  */
-export function savePresetsToPreferences(presets) {
-    try {
-        api.setPreferenceObject("easey_presets", presets);
-    } catch (e) {
-        console.log("Could not save presets to preferences:", e.message);
-    }
+export function movePresetToLibrary(model, libraryIndex, presetIndex, targetLibraryIndex) {
+    var source = getLibrary(model, libraryIndex);
+    var target = getLibrary(model, targetLibraryIndex);
+
+    if (!source || !target || source === target) return false;
+    if (!source.presets[presetIndex]) return false;
+
+    target.presets.push(source.presets.splice(presetIndex, 1)[0]);
+    return true;
 }
 
-/**
- * Load presets from preferences
- * @param {Object} presets - Presets object to populate
- */
-export function loadPresetsFromPreferences(presets) {
-    try {
-        if (api.hasPreferenceObject("easey_presets")) {
-            var savedPresets = api.getPreferenceObject("easey_presets");
-            if (savedPresets !== null && savedPresets !== undefined) {
-                // Clear existing and copy saved
-                for (var key in presets) {
-                    delete presets[key];
-                }
-                for (var key in savedPresets) {
-                    presets[key] = savedPresets[key];
-                }
-            }
-        }
-    } catch (e) {
-        console.log("Could not load presets from preferences:", e.message);
-    }
+export function deleteLibraryPreset(model, libraryIndex, presetIndex) {
+    var library = getLibrary(model, libraryIndex);
+    if (!library || !library.presets[presetIndex]) return false;
+
+    var modal = new ui.Modal();
+    var confirmText = "Delete the preset \"" + library.presets[presetIndex].name +
+        "\"?\n\nThis action cannot be undone.";
+
+    if (!modal.showConfirmation("Delete Preset", confirmText)) return false;
+
+    library.presets.splice(presetIndex, 1);
+    return true;
 }
 
 /**
@@ -303,6 +397,64 @@ export function loadClampIdenticalSetting() {
 }
 
 /**
+ * Save the presets page layout
+ * @param {string} layout - "list" or "grid"
+ */
+export function savePresetLayoutSetting(layout) {
+    try {
+        api.setPreferenceObject("easey_presetLayout", layout);
+    } catch (e) {
+        console.log("Could not save preset layout setting:", e.message);
+    }
+}
+
+/**
+ * Load the presets page layout
+ * @returns {string} "list" or "grid" (default: "list")
+ */
+export function loadPresetLayoutSetting() {
+    try {
+        if (api.hasPreferenceObject("easey_presetLayout")) {
+            var saved = api.getPreferenceObject("easey_presetLayout");
+            if (saved === "list" || saved === "grid") {
+                return saved;
+            }
+        }
+    } catch (e) {
+        console.log("Could not load preset layout setting:", e.message);
+    }
+    return "list";
+}
+
+/**
+ * Remember that the banner for a given version was dismissed.
+ * Stored per version so a later release surfaces the banner again.
+ * @param {string} version - The version that was dismissed
+ */
+export function saveDismissedUpdate(version) {
+    try {
+        api.setPreferenceObject("easey_dismissedUpdate", version);
+    } catch (e) {
+        console.log("Could not save dismissed update:", e.message);
+    }
+}
+
+/**
+ * @returns {string|null} The dismissed version, or null
+ */
+export function loadDismissedUpdate() {
+    try {
+        if (api.hasPreferenceObject("easey_dismissedUpdate")) {
+            var saved = api.getPreferenceObject("easey_dismissedUpdate");
+            if (typeof saved === "string") return saved;
+        }
+    } catch (e) {
+        console.log("Could not load dismissed update:", e.message);
+    }
+    return null;
+}
+
+/**
  * Save last selected tab to preferences
  * @param {number} tabIndex - Index of the selected tab
  */
@@ -330,27 +482,6 @@ export function loadLastSelectedTab() {
         console.log("Could not load last selected tab:", e.message);
     }
     return null;
-}
-
-/**
- * Populate preset dropdown with presets
- * @param {Object} dropdown - The ui.DropDown element
- * @param {Object} presets - Presets object
- */
-export function populatePresetDropdown(dropdown, presets) {
-    dropdown.clear();
-    
-    dropdown.addEntry("Select a preset...");
-    dropdown.insertSeparator(1);
-    
-    var presetNames = Object.keys(presets);
-    presetNames.sort(function(a, b) {
-        return a.toLowerCase().localeCompare(b.toLowerCase());
-    });
-    
-    for (var i = 0; i < presetNames.length; i++) {
-        dropdown.addEntry(presetNames[i]);
-    }
 }
 
 /**

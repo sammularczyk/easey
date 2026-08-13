@@ -2,6 +2,7 @@
 // Handles mouse interactions for both value and speed graph canvases
 
 import { speedToCubicBezier } from './conversions.js';
+import { updateBannerHit, updateBannerRegions, updateBannerContains } from './graphRenderer.js';
 
 /**
  * On-screen positions of the value graph's two control handles, clamped the
@@ -82,6 +83,50 @@ function handleAt(position, handles, order, radius) {
 }
 
 /**
+ * Route a press that landed on the update banner.
+ * @returns {boolean} Whether the press was consumed
+ */
+function handleBannerPress(position, config, options) {
+    var hit = updateBannerHit(position, config.width);
+
+    if (hit === "download") {
+        if (options.onUpdateBannerClick) options.onUpdateBannerClick();
+        return true;
+    }
+
+    if (hit === "dismiss") {
+        if (options.onUpdateBannerDismiss) options.onUpdateBannerDismiss();
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Track hover over the banner: anywhere on the strip reveals the dismiss X,
+ * and the download link highlights on its own.
+ * @returns {boolean} Whether either hover state changed
+ */
+function updateBannerHover(position, config, state) {
+    var row = false;
+    var download = false;
+
+    if (config.updateAvailable) {
+        var regions = updateBannerRegions(config.width);
+        row = updateBannerContains(regions, "row", position);
+        download = row && updateBannerContains(regions, "download", position);
+    }
+
+    if (row === state.bannerRowHover && download === state.bannerDownloadHover) {
+        return false;
+    }
+
+    state.bannerRowHover = row;
+    state.bannerDownloadHover = download;
+    return true;
+}
+
+/**
  * Create mouse handlers for the value graph canvas
  * @param {Object} options - Handler options
  * @param {Object} options.canvas - The graph canvas element
@@ -101,6 +146,11 @@ export function setupValueGraphHandlers(options) {
 
     canvas.onMousePress = function(position, button) {
         var config = getConfig();
+
+        // Checked before the handles: the banner overlays the graph's bottom
+        // edge, where a handle could otherwise sit.
+        if (config.updateAvailable && handleBannerPress(position, config, options)) return;
+
         var handles = valueHandlePositions(config, state);
         var hit = handleAt(position, handles, ['cp1', 'cp2'], config.handleRadius * 2);
 
@@ -123,9 +173,10 @@ export function setupValueGraphHandlers(options) {
 
         // Fires without a button held because the canvas enables hover events.
         if (!state.isDragging) {
+            var bannerChanged = updateBannerHover(position, config, state);
             var hovered = handleAt(position, valueHandlePositions(config, state), ['cp1', 'cp2'], config.handleRadius * 2);
 
-            if (hovered !== state.hoveredHandle) {
+            if (hovered !== state.hoveredHandle || bannerChanged) {
                 state.hoveredHandle = hovered;
                 if (onHoverChange) onHoverChange();
             }
@@ -242,6 +293,9 @@ export function setupSpeedGraphHandlers(options) {
 
     canvas.onMousePress = function(position, button) {
         var config = getConfig();
+
+        if (config.updateAvailable && handleBannerPress(position, config, options)) return;
+
         var handles = speedHandlePositions(config, state);
         var hit = handleAt(position, handles, ['out', 'in'], config.handleRadius * 2);
 
@@ -256,9 +310,10 @@ export function setupSpeedGraphHandlers(options) {
 
         // Fires without a button held because the canvas enables hover events.
         if (!state.speedDragging) {
+            var bannerChanged = updateBannerHover(position, config, state);
             var hovered = handleAt(position, speedHandlePositions(config, state), ['out', 'in'], config.handleRadius * 2);
 
-            if (hovered !== state.speedHoveredHandle) {
+            if (hovered !== state.speedHoveredHandle || bannerChanged) {
                 state.speedHoveredHandle = hovered;
                 if (onHoverChange) onHoverChange();
             }
