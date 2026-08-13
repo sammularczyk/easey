@@ -367,6 +367,16 @@ export function buildTabStrip(tabs, onSelect) {
             for (var i = 0; i < entries.length; i++) {
                 entries[i].label.setHidden(state);
             }
+        },
+        /**
+         * Show or hide a single tab, for layouts that surface its page some
+         * other way.
+         * @param {number} index
+         * @param {boolean} visible
+         */
+        setTabVisible: function(index, visible) {
+            if (!entries[index]) return;
+            entries[index].container.setHidden(!visible);
         }
     };
 }

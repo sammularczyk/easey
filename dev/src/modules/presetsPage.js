@@ -337,7 +337,18 @@ export function createPresetsPage(config) {
                     grid.add(buildPresetTile(i, library.presets[g], g, tokens, selection));
                 }
 
-                listLayout.add(grid);
+                // A FlowLayout has no height of its own, so a tall window hands
+                // it the leftover space and the tiles drift apart. Hosting it in
+                // a Container fixed to the height it actually needs pins the
+                // rows together and leaves the slack to the trailing stretch.
+                var gridHost = new ui.Container();
+                gridHost.setLayout(grid);
+
+                var gridWidth = Math.max(TILE_MIN, availableWidth - ROW_PADDING * 2);
+                var gridHeight = grid.getHeightForWidth(gridWidth);
+                if (gridHeight > 0) gridHost.setFixedHeight(gridHeight);
+
+                listLayout.add(gridHost);
                 continue;
             }
 
