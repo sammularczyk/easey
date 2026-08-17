@@ -12,6 +12,20 @@ var IDENTICAL_VALUE_EPSILON = 0.001;
 
 var _clampHoldsEnabled = true;
 
+// Measured: 10 is the floor. Accuracy is flat from 60 samples down to 10 (a 600px move fits
+// to within 0.6px either way) and falls off a cliff at 8. Scrubbing is nearly free — 61
+// samples cost 0.35ms — so the whole budget goes on fitEase, which runs ~16ms at this count
+// against ~120ms at 60.
+var VELOCITY_FIT_SAMPLES = 10;
+
+// Fits from the last read, keyed by segment, each holding the curve that was fitted and the
+// speed/influence it was fitted from. Lets Apply put a segment back exactly as found when the
+// user never touched its curve — see restoreUneditedVelocity.
+var _velocityFits = {};
+// Ghost curves re-read on every selection change, so entries would otherwise pile up all
+// session. Nothing needs to survive beyond a Get followed by an Apply.
+var VELOCITY_FIT_CACHE_MAX = 64;
+
 /**
  * Set whether identical-value clamping is active (called from Easey.js when preference changes).
  */
@@ -597,6 +611,13 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
     for (var j = 0; j < n - 1; j++) {
         var f0 = frames[j];
         var f1 = frames[j + 1];
+
+        // Untouched since Get read it: put back exactly what was there. Reconverting the
+        // fitted curve would drift a segment the user never edited.
+        if (restoreUneditedVelocity(layerId, f0, f1, currentEasing, velocityByFrame)) {
+            continue;
+        }
+
         var isHold = _clampHoldsEnabled &&
             valuesAreIdentical(valuesX[j], valuesX[j + 1]) &&
             valuesAreIdentical(valuesY[j], valuesY[j + 1]);
@@ -1043,6 +1064,160 @@ function applyEasingToSingleKeyframe(keyframeId, attrId, layerId, frame, value, 
     }
 }
 
+function velocityFitKey(layerId, attrId, frameA, frameB) {
+    return layerId + '|' + attrId + '|' + frameA + '|' + frameB;
+}
+
+/**
+ * Recover a velocity-driven segment's easing by measuring what it actually renders.
+ *
+ * Cavalry's speed + influence does not map onto a cubic-bezier the way the standard formula
+ * assumes, so converting the numbers reports a curve the layer is not following. Measured on
+ * a 600px move: Cavalry's own defaults (speed 1, influence 0.333) read as 14px off, and
+ * livelier settings as much as 79px. Sampling the rendered motion and fitting a bezier to it
+ * lands within 0.3px to 17px across the same cases — better in every one.
+ *
+ * The fit is also indifferent to WHY the formula disagrees. Whether it is the speed mapping,
+ * the arc-length pre-warping this file's path solver already contends with, or something
+ * that changes in a future Cavalry release, the fit tracks whatever is on screen.
+ *
+ * Seeding the search with the formula's answer was measured slower and no more accurate, so
+ * fitEase starts from its own default.
+ *
+ * Scrubs the timeline; the caller restores the frame.
+ *
+ * @returns {Object|null} {x1, y1, x2, y2}, or null when the segment carries no value change
+ *          to normalise against
+ */
+function fitSegmentEasing(layerId, attrId, frameA, frameB, frameDiff, firstValue, valueDiff) {
+    if (Math.abs(valueDiff) < IDENTICAL_VALUE_EPSILON || !(frameDiff > 0)) {
+        return null;
+    }
+
+    // Never ask for more samples than the segment has frames — setFrame takes integers, and
+    // oversampling a short segment just reads the same frame repeatedly.
+    var count = Math.max(2, Math.min(VELOCITY_FIT_SAMPLES, Math.round(frameDiff)));
+    var times = [];
+    var values = [];
+
+    for (var i = 0; i <= count; i++) {
+        var frame = Math.round(frameA + (i / count) * frameDiff);
+        api.setFrame(frame);
+        // Time comes from the frame actually sampled, not the ideal fraction, so rounding
+        // cannot skew the fit.
+        times.push((frame - frameA) / frameDiff);
+        values.push((api.get(layerId, attrId) - firstValue) / valueDiff);
+    }
+
+    var fitted = fitEase(times, values, Math.max(0.01, 1 / frameDiff));
+    return { x1: fitted.x1, y1: fitted.y1, x2: fitted.x2, y2: fitted.y2 };
+}
+
+/**
+ * Recover a curved motion path segment's easing by measuring DISTANCE travelled over time.
+ *
+ * A single position channel is not a usable progress signal on a curved path. Measured on a
+ * real 65-frame segment whose path is 3.7x longer than its straight-line distance, position.x
+ * runs backwards on 12 of 65 frames and swings to -1.26 of the segment's span before arriving.
+ * Fitting a monotonic easing curve to that is impossible: fitEase pinned both its influence
+ * bounds and returned 1, 0, 0, 0.197 at rms 0.46, a curve with no relationship to the motion.
+ * Against arc length the same segment fits to 0.125, 0, 0.109, 1 at rms 0.0026.
+ *
+ * Distance comes from the same arc table and projection the write-side solver uses, rather
+ * than summing chords between sampled frames: where the layer covers hundreds of units in one
+ * frame the chord badly understates the distance, and that error is largest exactly where the
+ * easing is steepest.
+ *
+ * Scrubs the timeline; the caller restores the frame.
+ *
+ * @returns {Object|null} {x1, y1, x2, y2}, or null when the path could not be measured
+ */
+function fitMotionPathEasing(layerId, frameA, frameB, frameDiff) {
+    if (!(frameDiff > 0)) {
+        return null;
+    }
+
+    api.setFrame(frameA);
+    var startX = api.get(layerId, 'position.x');
+    var startY = api.get(layerId, 'position.y');
+    api.setFrame(frameB);
+    var endX = api.get(layerId, 'position.x');
+    var endY = api.get(layerId, 'position.y');
+
+    var points = motionPathControlPoints(layerId, frameA, frameB, startX, startY, endX, endY);
+    if (!points) {
+        return null;
+    }
+    var table = buildArcTable(points);
+    if (!(table.total > 0)) {
+        return null;
+    }
+
+    var count = Math.max(2, Math.min(VELOCITY_FIT_SAMPLES, Math.round(frameDiff)));
+    var times = [];
+    var values = [];
+
+    for (var i = 0; i <= count; i++) {
+        var frame = Math.round(frameA + (i / count) * frameDiff);
+        api.setFrame(frame);
+        var u = projectToPath(points, [api.get(layerId, 'position.x'), api.get(layerId, 'position.y')]);
+        times.push((frame - frameA) / frameDiff);
+        values.push(arcAt(table, u));
+    }
+
+    var fitted = fitEase(times, values, Math.max(0.01, 1 / frameDiff));
+    return { x1: fitted.x1, y1: fitted.y1, x2: fitted.x2, y2: fitted.y2 };
+}
+
+/**
+ * True when a motion path segment should keep the speed + influence it already has.
+ *
+ * Get reads these segments by fitting the motion they render rather than by converting their
+ * speed and influence, because the conversion does not describe what Cavalry draws. That
+ * makes the round trip lossy in the other direction too: converting the fit back would nudge
+ * a curve the user never touched. So when the easing is still exactly what the fit returned,
+ * and the keyframes still carry the values it was measured from, the originals stay.
+ *
+ * Returns true meaning "leave it alone" — velocityByFrame is already seeded from the live
+ * keyframes, so declining to write is the restore.
+ */
+function restoreUneditedVelocity(layerId, frameA, frameB, currentEasing, velocityByFrame) {
+    var entry = _velocityFits[velocityFitKey(layerId, 'position.x', frameA, frameB)] ||
+                _velocityFits[velocityFitKey(layerId, 'position.y', frameA, frameB)];
+
+    return velocityFitIsUnedited(entry, currentEasing, velocityByFrame[frameA], velocityByFrame[frameB]);
+}
+
+/**
+ * The decision behind restoreUneditedVelocity, split out so it can be tested without a scene.
+ *
+ * @param {Object|null} entry - cached {easing, velocity}, or null when nothing was fitted
+ * @param {Object} currentEasing - the curve about to be applied
+ * @param {Object} live0 - speed/influence currently on the start keyframe
+ * @param {Object} live1 - speed/influence currently on the end keyframe
+ * @returns {boolean} true when the segment should be left exactly as it is
+ */
+export function velocityFitIsUnedited(entry, currentEasing, live0, live1) {
+    if (!entry || !entry.easing || !entry.velocity || !currentEasing || !live0 || !live1) {
+        return false;
+    }
+
+    // Exact equality on purpose. Any drag, preset or typed value produces a different number,
+    // so this cannot swallow a real edit; the cost of being wrong the other way is silently
+    // discarding one.
+    var e = entry.easing;
+    if (e.x1 !== currentEasing.x1 || e.y1 !== currentEasing.y1 ||
+        e.x2 !== currentEasing.x2 || e.y2 !== currentEasing.y2) {
+        return false;
+    }
+
+    // The scene can move under a cached fit — edited in Cavalry's own graph editor, undone,
+    // rebuilt. Only trust it while the keyframes still hold what it was measured from.
+    var v = entry.velocity;
+    return live0.rightSpeed === v.rightSpeed && live0.rightInfluence === v.rightInfluence &&
+           live1.leftSpeed === v.leftSpeed && live1.leftInfluence === v.leftInfluence;
+}
+
 /**
  * Read one segment's normalised easing from the two keyframes bounding it.
  *
@@ -1088,14 +1263,45 @@ function readSegment(layerId, attrId, keyIdA, keyIdB, frameA, frameB) {
 
     var easing;
     if (segmentUsesVelocity(frameZeroData, frameEndData)) {
-        // Velocity-eased motion path segment: the handles are flat, the easing lives in
-        // speed + influence.
-        easing = velocityToCubicBezier(
-            frameZeroData.rightSpeed,
-            frameZeroData.rightInfluence,
-            frameEndData.leftSpeed,
-            frameEndData.leftInfluence
-        );
+        // Velocity-eased segment: the handles are flat and the easing lives in speed +
+        // influence, which does not convert faithfully — so measure the motion instead.
+        var velocity = {
+            rightSpeed: frameZeroData.rightSpeed,
+            rightInfluence: frameZeroData.rightInfluence,
+            leftSpeed: frameEndData.leftSpeed,
+            leftInfluence: frameEndData.leftInfluence
+        };
+
+        // On a curved path a single channel is not progress — it can run backwards and
+        // overshoot its own endpoints while the layer only ever moves forwards along the
+        // path. Measure distance travelled instead whenever both channels are keyed here.
+        var siblingTimes = getSiblingKeyframeTimesSet(layerId, attrId);
+        if (isMotionPathPair(siblingTimes, frameA, frameB)) {
+            easing = fitMotionPathEasing(layerId, frameA, frameB, frameDiff);
+        }
+
+        if (!easing) {
+            easing = fitSegmentEasing(layerId, attrId, frameA, frameB, frameDiff, firstValue, valueDiff);
+        }
+
+        if (easing) {
+            if (Object.keys(_velocityFits).length > VELOCITY_FIT_CACHE_MAX) {
+                _velocityFits = {};
+            }
+            _velocityFits[velocityFitKey(layerId, attrId, frameA, frameB)] = {
+                easing: { x1: easing.x1, y1: easing.y1, x2: easing.x2, y2: easing.y2 },
+                velocity: velocity
+            };
+        } else {
+            // Nothing to measure against — a hold, or a channel that does not move. The
+            // formula is no worse than nothing here.
+            easing = velocityToCubicBezier(
+                velocity.rightSpeed,
+                velocity.rightInfluence,
+                velocity.leftSpeed,
+                velocity.leftInfluence
+            );
+        }
     } else if (frameZeroData.rightBez && frameEndData.leftBez) {
         easing = cavalryToCubicBezier(
             frameZeroData.rightBez.x,
@@ -1213,6 +1419,9 @@ export function readNeighbourSegments() {
  * @returns {boolean} Success status
  */
 export function getEasingFromKeyframes(currentEasing) {
+    // Fits only need to survive until the matching Apply, and a stale one from an earlier
+    // selection must never be mistaken for this one's.
+    _velocityFits = {};
     try {
         var selectedKeyframes = api.getSelectedKeyframes();
         var keyframeIds = api.getSelectedKeyframeIds();
