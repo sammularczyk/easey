@@ -63,7 +63,7 @@ import { checkForUpdate } from './modules/updateChecker.js';
 import { getCompositionFrameRate } from './modules/conversions.js';
 import { drawCurve, drawSpeedCurve } from './modules/graphRenderer.js';
 import { setupValueGraphHandlers, setupSpeedGraphHandlers } from './modules/mouseHandlers.js';
-import { getEasingFromKeyframes, applyEasingToKeyframes, fixHoldPaths, setClampHoldsEnabled, copyKeyframeDuration, copyKeyframeValues, copyAllKeyframeInfo } from './modules/keyframeOps.js';
+import { getEasingFromKeyframes, applyEasingToKeyframes, fixHoldPaths, setClampHoldsEnabled, copyKeyframeDuration, copyKeyframeValues, copyAllKeyframeInfo, readNeighbourSegments } from './modules/keyframeOps.js';
 import { 
     loadLibraries, saveLibraries, createLibrary, renameLibrary, deleteLibrary,
     exportLibrary, importLibrary, savePresetToLibrary, renameLibraryPreset,
@@ -118,6 +118,12 @@ var currentEasing = Object.assign({}, DEFAULT_EASING);
 // Speed graph state
 var speedEasing = Object.assign({}, DEFAULT_SPEED_EASING);
 
+// The segments either side of the selected one, drawn as dim read-only ghosts so you can
+// see what the curve you are building connects to. Read on Get and held until the next one —
+// editing the interior handles cannot change what the neighbours do, so they should not
+// move while you drag. null hides them.
+var neighbourSegments = null;
+
 // Graph dimensions (mutable for resize)
 var graphWidth = GRAPH_CONFIG.width;
 var graphHeight = GRAPH_CONFIG.height;
@@ -151,6 +157,27 @@ var bannerDownloadHover = false;
 
 // Window width below which the tab strip drops its labels and shows icons only
 var TAB_LABEL_MIN_WIDTH = 240;
+
+// Index of the Presets tab, hidden while the split layout shows the panel
+var PRESETS_TAB = 2;
+
+// The graph's share of the usable height once the layout has split; the panel
+// takes the rest. Unsplit, the graph takes all of it.
+var GRAPH_SHARE_SPLIT = 0.5;
+
+// Our own chrome inside ui.size(): tab strip (31) + bottom bar (33) + margins,
+// plus a few px of slack. Filling the height exactly leaves no room for
+// rounding, and the overflow becomes a scroll bar on the whole window.
+var OWN_CHROME_HEIGHT = 78;
+
+// Window height at which the presets panel replaces the Presets tab.
+var SPLIT_MIN_HEIGHT = 450;
+
+// Floor for the panel's height once the layout has split.
+var MIN_PANEL_HEIGHT = 90;
+
+// Whether the presets panel is currently shown beneath the controls
+var isSplitLayout = false;
 
 // Settings
 var updateCheckEnabled = loadUpdateCheckSetting();
@@ -187,6 +214,9 @@ var getButton = buildIconButton("get", "Get easing from keyframes");
 // Text input for cubic bezier values
 var bezierInput = new ui.LineEdit();
 bezierInput.setText("0.25, 0.1, 0.25, 1.0");
+// Lets the bottom bar compress. Left at its natural minimum the field keeps the
+// bar wider than a narrow window, and the apply button is pushed off the edge.
+bezierInput.setMinimumWidth(50);
 
 // Context menu button for preset actions
 var presetContextButton = new ui.ImageButton(getAssetPath("icon-settings"));
@@ -264,6 +294,7 @@ function getGraphConfig() {
         padding: graphPadding,
         handleRadius: handleRadius,
         hoveredHandle: hoveredHandle,
+        neighbours: neighbourSegments,
         updateAvailable: isUpdateBannerVisible(),
         bannerRowHover: bannerRowHover,
         bannerDownloadHover: bannerDownloadHover
@@ -277,6 +308,7 @@ function getSpeedGraphConfig() {
         padding: speedGraphPadding,
         handleRadius: speedHandleRadius,
         hoveredHandle: speedHoveredHandle,
+        neighbours: neighbourSegments,
         updateAvailable: isUpdateBannerVisible(),
         bannerRowHover: bannerRowHover,
         bannerDownloadHover: bannerDownloadHover
@@ -397,7 +429,12 @@ function clearPresetSelection() {
 
     selection.libraryIndex = -1;
     selection.presetIndex = -1;
+    refreshPresets();
+}
+
+function refreshPresets() {
     presetsPage.refresh();
+    presetsPanel.refresh();
 }
 
 // Persist the model and rebuild the presets page. Every mutation goes through
@@ -405,7 +442,7 @@ function clearPresetSelection() {
 // across a change.
 function commitPresetChange() {
     saveLibraries(presetModel);
-    presetsPage.refresh();
+    refreshPresets();
 }
 
 function loadPresetIntoEditor(preset) {
@@ -644,7 +681,7 @@ function showPresetContextMenu() {
 
                 presetLayout = layout;
                 savePresetLayoutSetting(layout);
-                presetsPage.refresh();
+                refreshPresets();
             }
         });
     });
@@ -735,6 +772,9 @@ applyButton.onMousePress = function() {
 
 getButton.onMousePress = function() {
     if (getEasingFromKeyframes(currentEasing)) {
+        // Read after the easing, so a selection Easey can read but cannot resolve to a
+        // single segment still updates the curve and simply shows no ghosts.
+        neighbourSegments = readNeighbourSegments();
         updateTextInput();
         redrawGraphs();
     }
@@ -794,20 +834,42 @@ mainLayout.setMargins(3, 3, 3, 3);
 var valueTabLayout = new ui.VLayout();
 valueTabLayout.setSpaceBetween(0);
 valueTabLayout.setMargins(0, 0, 0, 0);
-valueTabLayout.addStretch();
-valueTabLayout.add(graphCanvas);
-valueTabLayout.addStretch();
+// A VLayout will not centre a fixed-width child, so the square canvas needs
+// stretches on both axes.
+var graphCanvasRow = new ui.HLayout();
+graphCanvasRow.setMargins(0, 0, 0, 0);
+graphCanvasRow.addStretch();
+graphCanvasRow.add(graphCanvas);
+graphCanvasRow.addStretch();
+
+// No vertical stretch: it would make this page expandable, and the PageView
+// would then claim all the spare height and float the graph in the middle of
+// it. The horizontal stretches inside the row still centre the square.
+valueTabLayout.add(graphCanvasRow);
 
 // SPEED PAGE
 var speedTabLayout = new ui.VLayout();
 speedTabLayout.setSpaceBetween(0);
 speedTabLayout.setMargins(0, 0, 0, 0);
-speedTabLayout.addStretch();
-speedTabLayout.add(speedGraphCanvas);
-speedTabLayout.addStretch();
+// A VLayout will not centre a fixed-width child, so the square canvas needs
+// stretches on both axes.
+var speedGraphCanvasRow = new ui.HLayout();
+speedGraphCanvasRow.setMargins(0, 0, 0, 0);
+speedGraphCanvasRow.addStretch();
+speedGraphCanvasRow.add(speedGraphCanvas);
+speedGraphCanvasRow.addStretch();
 
-// PRESETS PAGE
-var presetsPage = createPresetsPage({
+// No vertical stretch: it would make this page expandable, and the PageView
+// would then claim all the spare height and float the graph in the middle of
+// it. The horizontal stretches inside the row still centre the square.
+speedTabLayout.add(speedGraphCanvasRow);
+
+// PRESETS
+// Two instances of the same list: one inside the tab page, one in the bottom
+// panel used by the split layout. Cavalry cannot reparent a widget — clearing a
+// layout destroys its children — so the list cannot move between the two as the
+// window resizes. Both read the same model and are refreshed together.
+var presetsConfig = {
     getModel: function() {
         return presetModel;
     },
@@ -824,7 +886,7 @@ var presetsPage = createPresetsPage({
         loadPresetIntoEditor(preset);
         isUpdatingFromPreset = false;
 
-        presetsPage.refresh();
+        refreshPresets();
 
         // Apply straight away. This logs and no-ops when no keyframes are
         // selected, so it is safe on every click.
@@ -836,7 +898,10 @@ var presetsPage = createPresetsPage({
     },
     onLibraryMenu: showLibraryMenu,
     onPresetMenu: showPresetRowMenu
-});
+};
+
+var presetsPage = createPresetsPage(presetsConfig);
+var presetsPanel = createPresetsPage(presetsConfig);
 
 // PageView rather than TabView: TabView's chrome cannot be styled at all, so
 // the tab strip above is built by hand and drives the pages directly.
@@ -855,7 +920,9 @@ var tabStrip = buildTabStrip([
     saveTabPreference();
 });
 
-// Add to main layout
+// Add to main layout. The PageView is a layout, not a widget: it has none of
+// the common functions, and hosting it in a Container stops it rendering. Its
+// height therefore cannot be set — it is governed by what its pages need.
 mainLayout.add(tabStrip.widget);
 mainLayout.add(pageView);
 
@@ -867,6 +934,20 @@ buttonRow.setSpaceBetween(7);
 buttonRow.setMargins(0, 4, 0, 0);
 mainLayout.add(buttonRow);
 
+// Presets panel, shown only by the split layout. Hidden rather than omitted,
+// because it cannot be added later without rebuilding the layout.
+var panelHost = new ui.Container();
+panelHost.setLayout(presetsPanel.widget);
+panelHost.setHidden(true);
+mainLayout.add(panelHost);
+
+// Absorbs the leftover height in tabbed mode, where there is no panel to take
+// it. Without this the layout hands the slack back to the PageView, which
+// re-centres the graph and leaves a gap above it. Hidden widgets take no space,
+// so exactly one of these two is ever active.
+var tailSpacer = new ui.Container();
+mainLayout.add(tailSpacer);
+
 // Add to UI
 ui.add(mainLayout);
 ui.setBackgroundColor(ui.getThemeColor("Base"));
@@ -874,55 +955,105 @@ ui.setBackgroundColor(ui.getThemeColor("Base"));
 // Initialize display
 updateTextInput();
 redrawGraphs();
-presetsPage.refresh();
+refreshPresets();
 
 // PageView has no onPageChanged callback; the tab strip's onSelect above is
 // the only way pages change, and it already redraws and saves.
 
-// Window size
-ui.setMinimumWidth(graphWidth);
-ui.setMinimumHeight(graphHeight + 60);
+// Window size. Deliberately small: the layout computes its own sizes on every
+// resize, and a minimum derived from the initial GRAPH_CONFIG would fight it.
+ui.setMinimumWidth(220);
+ui.setMinimumHeight(260);
 
 // Resize handler
 ui.onResize = function() {
     var newWidth = ui.size().width;
     var newHeight = ui.size().height;
-    
-    // Tab strip (31) + bottom bar row (33) + window margins. Must over- rather
-    // than under-estimate: too small and the window grows a scrollbar, which
-    // overlaps the controls.
-    var controlsHeight = 90;
-    // Must comfortably exceed the main layout's own left+right margins. Sizing
-    // the canvas to the full width leaves the layout no slack, so the canvas
-    // asks for more room than the content area has, the window grows to fit,
-    // and the next resize reads the larger size — the window then ratchets
-    // wider on every resize or tab change.
+
+    // Must comfortably exceed the main layout's own left+right margins, or the
+    // canvas asks for more room than the content area has and the window
+    // ratchets wider on every resize.
     var margin = 14;
+    var availableWidth = Math.max(150, newWidth - margin);
+
+    // ui.size() reports the area available to this layout: it already excludes
+    // Cavalry's window title bar and script tab. The only chrome to subtract is
+    // ours — the tab strip, the bottom bar and the window margins.
+    var availableHeight = Math.max(150, newHeight - OWN_CHROME_HEIGHT);
+
+    var split = newHeight >= SPLIT_MIN_HEIGHT;
+
+    // Square, so the curve is never distorted by the window's aspect ratio. It
+    // takes everything going spare unless the panel needs its share.
+    var graphSpace = split ? Math.floor(availableHeight * GRAPH_SHARE_SPLIT) : availableHeight;
+    var square = Math.max(150, Math.min(availableWidth, graphSpace));
+
+    // Whatever the square leaves, so the two together exactly fill the height.
+    var panelHeight = Math.max(MIN_PANEL_HEIGHT, availableHeight - square);
 
     // Below this the labels no longer fit beside the icons.
     tabStrip.setCompact(newWidth < TAB_LABEL_MIN_WIDTH);
 
-    // Ahead of the early-out below, since the grid has to react to a width
-    // change even when the graph's size is unchanged.
-    presetsPage.setAvailableWidth(newWidth - margin);
+    // Runs ahead of the early-out below, because a height change can flip the
+    // layout mode without altering the square's size.
+    if (split !== isSplitLayout) {
+        isSplitLayout = split;
+        panelHost.setHidden(!split);
+        tabStrip.setTabVisible(PRESETS_TAB, !split);
 
-    var newGraphWidth = Math.max(150, newWidth - margin);
-    var newGraphHeight = Math.max(150, newHeight - controlsHeight);
+        // The Presets tab is gone in split mode, so its page must not stay up.
+        if (split && pageView.currentPage() === PRESETS_TAB) {
+            pageView.setPage(0);
+            tabStrip.setSelected(0);
+        }
+    }
+
+    // The panel is given an explicit height: a ScrollView with no restriction
+    // grows to its content and drags the whole window with it.
+    if (split) {
+        panelHost.setFixedHeight(panelHeight);
+        // The scroll area needs the bound too, or it grows to its content and
+        // pushes past the host.
+        presetsPanel.setViewportHeight(panelHeight);
+    }
+
+    presetsPage.setAvailableWidth(availableWidth);
+    presetsPanel.setAvailableWidth(availableWidth);
+    // The tab-mode list shares the graph's slot, so it gets the same height.
+    presetsPage.setViewportHeight(square);
+
 
     // Re-applying an unchanged size is what turns any sizing feedback into a
     // runaway loop, so bail out when nothing actually moved.
-    if (newGraphWidth === graphWidth && newGraphHeight === graphHeight) return;
+    if (square === graphWidth && square === graphHeight) return;
 
-    graphWidth = newGraphWidth;
-    graphHeight = newGraphHeight;
-    speedGraphWidth = newGraphWidth;
-    speedGraphHeight = newGraphHeight;
-    
-    graphCanvas.setSize(graphWidth, graphHeight);
-    speedGraphCanvas.setSize(speedGraphWidth, speedGraphHeight);
-    
+    graphWidth = square;
+    graphHeight = square;
+    speedGraphWidth = square;
+    speedGraphHeight = square;
+
+    graphCanvas.setSize(square, square);
+    speedGraphCanvas.setSize(square, square);
+
     redrawGraphs();
 };
+
+// Keep the ghosts in step with the keyframe selection.
+//
+// Deliberately does NOT touch currentEasing: the curve on the graph is what you are
+// building, and having it jump to whatever you just clicked would throw away in-progress
+// work. Only the read-only context around it follows the selection. Hit Get to actually
+// load the selected keyframes' easing.
+function Callbacks() {
+    this.onKeySelectionChanged = function () {
+        var next = readNeighbourSegments();
+        // Both null is the common case while clicking around; skip the repaint.
+        if (next === null && neighbourSegments === null) return;
+        neighbourSegments = next;
+        redrawGraphs();
+    };
+}
+ui.addCallbackObject(new Callbacks());
 
 // Show window
 ui.show();
@@ -933,6 +1064,11 @@ isInitializingTab = true;
 var savedTab = loadLastSelectedTab();
 if (savedTab !== null) {
     var restoredTab = Math.max(0, Math.min(pageView.pageCount() - 1, savedTab));
+
+    // The Presets tab is hidden while the split layout shows the panel, so
+    // restoring onto it would leave a page with no way back to it.
+    if (isSplitLayout && restoredTab === PRESETS_TAB) restoredTab = 0;
+
     pageView.setPage(restoredTab);
     tabStrip.setSelected(restoredTab);
 }

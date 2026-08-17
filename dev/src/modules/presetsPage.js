@@ -129,6 +129,9 @@ export function createPresetsPage(config) {
     pageLayout.setSpaceBetween(0);
     pageLayout.setMargins(0, 0, 0, 0);
     pageLayout.add(scrollView);
+    // Pins the fixed-height scroll area to the top. Without it the layout
+    // centres it, which reads as presets floating in mid-air.
+    pageLayout.addStretch();
 
     function buildPresetRow(library, libraryIndex, preset, presetIndex, tokens, selection) {
         var isSelected = selection.libraryIndex === libraryIndex &&
@@ -358,6 +361,8 @@ export function createPresetsPage(config) {
             }
         }
 
+        // Keeps libraries packed at the top instead of the layout sharing the
+        // spare height out between them.
         listLayout.addStretch();
     }
 
@@ -369,6 +374,18 @@ export function createPresetsPage(config) {
          * the tile size, so ordinary resize events cost nothing.
          * @param {number} width - Page width in px
          */
+        /**
+         * Bound the scrolling area's height.
+         * @param {number} height - Height in px
+         */
+        // ScrollView has setFixedHeight of its own. It cannot be wrapped in a
+        // Container — like PageView, hosting it that way stops it rendering.
+        // Left unbounded it grows to its content, and inside a PageView that
+        // inflates every page, since a PageView takes its largest page's
+        // height whichever tab is showing.
+        setViewportHeight: function(height) {
+            if (height > 0) scrollView.setFixedHeight(height);
+        },
         setAvailableWidth: function(width) {
             if (width === availableWidth) return;
             availableWidth = width;

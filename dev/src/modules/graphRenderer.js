@@ -1,7 +1,11 @@
 // Graph rendering module
 // Functions for drawing the value curve and speed curve on canvas elements
 
-import { cubicBezierToSpeed, sampleVelocityCurve } from './conversions.js';
+import {
+    cubicBezierToSpeed,
+    sampleVelocityCurveWithMax,
+    neighbourCurveControlPoints
+} from './conversions.js';
 import { getTokens, blend } from './theme.js';
 
 var DEFAULT_HANDLE_RADIUS = 6;
@@ -387,6 +391,124 @@ function drawGrid(canvas, bounds, tokens) {
     });
 }
 
+// Ghost curves: how far the neighbouring segments' colour is faded toward the plot
+// background. Traced from the design's #515151 on #373737 — dimmer than the curve, still
+// clearly brighter than the grid. Fading rather than setting a literal grey keeps them
+// legible when the Cavalry theme changes, the same trick textMuted uses.
+var GHOST_FADE = 0.86;
+var GHOST_STROKE = 1;
+// Enough to keep the visible stub smooth; only the part inside the gutter is ever seen.
+var GHOST_SAMPLES = 24;
+
+function ghostPaint(tokens) {
+    return {
+        "color": blend(tokens.curve, tokens.plotBg, GHOST_FADE),
+        "stroke": true,
+        "strokeWidth": GHOST_STROKE
+    };
+}
+
+/**
+ * Draw the previous and next segments as dim continuations in the gutter.
+ *
+ * Read-only decoration: no handles, no control lines, no hit targets. The neighbours cannot
+ * land inside the plot rect (their frames lie outside it), so nothing is clipped here — the
+ * canvas edge cuts off whatever runs past the padding, which is what the design shows.
+ *
+ * @param {Object} canvas - The ui.Draw canvas element
+ * @param {Object} neighbours - {sel, prev, next} from readNeighbourSegments
+ * @param {Object} bounds - {startX, startY, endX, endY} plot rectangle
+ * @param {Object} tokens - Theme tokens
+ */
+function drawValueGhosts(canvas, neighbours, bounds, tokens) {
+    var path = new cavalry.Path();
+    var drew = false;
+
+    var sides = [["prev", neighbours.prev], ["next", neighbours.next]];
+    for (var i = 0; i < sides.length; i++) {
+        var points = neighbourCurveControlPoints(sides[i][0], neighbours.sel, sides[i][1], bounds);
+        if (!points) continue;
+
+        path.moveTo(points.p0[0], points.p0[1]);
+        path.cubicTo(
+            points.cp1[0], points.cp1[1],
+            points.cp2[0], points.cp2[1],
+            points.p3[0], points.p3[1]
+        );
+        drew = true;
+    }
+
+    if (drew) {
+        canvas.addPath(path.toObject(), ghostPaint(tokens));
+    }
+}
+
+/**
+ * Draw the neighbouring segments' velocity as dim continuations in the gutter.
+ *
+ * The speed graph normalises each segment against its own peak, so a neighbour has to be
+ * measured against the SELECTED segment's peak in real value-per-frame units — otherwise
+ * every neighbour would peak at full height and say nothing about relative speed. A
+ * neighbour genuinely faster than the selection therefore runs off the top and is clipped,
+ * which is the honest reading.
+ *
+ * ponytail: the main curve's endpoints are nudged to sit on the handles (deltaStart /
+ * deltaEnd below); the ghosts get no such nudge, so a small gap can show at the join.
+ * Closing it means dropping that fudge from the main curve — a bigger change than this.
+ *
+ * @param {Object} canvas - The ui.Draw canvas element
+ * @param {Object} neighbours - {sel, prev, next} from readNeighbourSegments
+ * @param {Object} bounds - {startX, startY, endX, endY} plot rectangle
+ * @param {number} selPeak - the selected segment's peak speed, in value per frame
+ * @param {Object} tokens - Theme tokens
+ */
+function drawSpeedGhosts(canvas, neighbours, bounds, selPeak, tokens) {
+    if (!(selPeak > 0) || !(neighbours.sel.frameDiff > 0)) return;
+
+    var pxPerFrame = (bounds.endX - bounds.startX) / neighbours.sel.frameDiff;
+    var graphHeight = bounds.startY - bounds.endY;
+
+    var path = new cavalry.Path();
+    var drew = false;
+
+    var sides = [["prev", neighbours.prev], ["next", neighbours.next]];
+    for (var i = 0; i < sides.length; i++) {
+        var seg = sides[i][1];
+        if (!seg || !(seg.frameDiff > 0)) continue;
+
+        var originX = sides[i][0] === "prev"
+            ? bounds.startX - seg.frameDiff * pxPerFrame
+            : bounds.endX;
+        var spanX = seg.frameDiff * pxPerFrame;
+
+        var sampled = sampleVelocityCurveWithMax(
+            Math.min(0.999, Math.max(0.001, seg.easing.x1)),
+            seg.easing.y1,
+            Math.min(0.999, Math.max(0.001, seg.easing.x2)),
+            seg.easing.y2,
+            GHOST_SAMPLES
+        );
+        // sampled.samples are divided by this segment's own peak, so multiplying back by it
+        // and by the segment's real value-per-frame recovers absolute speed.
+        var segScale = sampled.max * Math.abs(seg.valueDiff / seg.frameDiff) / selPeak;
+
+        for (var s = 0; s <= GHOST_SAMPLES; s++) {
+            var x = originX + (s / GHOST_SAMPLES) * spanX;
+            var y = bounds.endY + sampled.samples[s] * segScale * graphHeight;
+            if (s === 0) {
+                path.moveTo(x, y);
+            } else {
+                path.lineTo(x, y);
+            }
+        }
+        drew = true;
+    }
+
+    if (drew) {
+        canvas.addPath(path.toObject(), ghostPaint(tokens));
+    }
+}
+
 /**
  * Draw the value (bezier) curve on the canvas
  * @param {Object} canvas - The ui.Draw canvas element
@@ -411,7 +533,13 @@ export function drawCurve(canvas, currentEasing, config) {
     var endX = width - padding;
     var endY = padding;
 
-    drawGrid(canvas, { startX: startX, startY: startY, endX: endX, endY: endY }, tokens);
+    var bounds = { startX: startX, startY: startY, endX: endX, endY: endY };
+    drawGrid(canvas, bounds, tokens);
+
+    // Before the curve, so the curve, handles and banner all paint over the ghosts.
+    if (config.neighbours) {
+        drawValueGhosts(canvas, config.neighbours, bounds, tokens);
+    }
 
     // Create bezier curve path
     var curvePath = new cavalry.Path();
@@ -500,7 +628,8 @@ export function drawSpeedCurve(canvas, currentEasing, speedEasing, config) {
     var endY = padding;
     var midX = startX + (endX - startX) / 2;
 
-    drawGrid(canvas, { startX: startX, startY: startY, endX: endX, endY: endY }, tokens);
+    var bounds = { startX: startX, startY: startY, endX: endX, endY: endY };
+    drawGrid(canvas, bounds, tokens);
 
     // Get current cubic-bezier values
     var x1 = currentEasing.x1;
@@ -522,7 +651,17 @@ export function drawSpeedCurve(canvas, currentEasing, speedEasing, config) {
 
     // Sample velocity curve
     var sampleCount = 50;
-    var velocitySamples = sampleVelocityCurve(x1Clamped, y1, x2Clamped, y2, sampleCount);
+    var sampledSelection = sampleVelocityCurveWithMax(x1Clamped, y1, x2Clamped, y2, sampleCount);
+    var velocitySamples = sampledSelection.samples;
+
+    // Ghosts before the curve, so the curve and handles paint over them. The neighbours are
+    // scaled against the selection's peak in real value-per-frame, which is what makes the
+    // three segments comparable on one axis.
+    if (config.neighbours && config.neighbours.sel.frameDiff > 0) {
+        var selPeak = sampledSelection.max *
+            Math.abs(config.neighbours.sel.valueDiff / config.neighbours.sel.frameDiff);
+        drawSpeedGhosts(canvas, config.neighbours, bounds, selPeak, tokens);
+    }
 
     // Draw velocity curve
     var curvePath = new cavalry.Path();
