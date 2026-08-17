@@ -78,11 +78,17 @@ export function cavalryToCubicBezier(outHandleX, outHandleY, inHandleX, inHandle
  * @param {number} y2
  * @returns {{ rightSpeed: number, rightInfluence: number, leftSpeed: number, leftInfluence: number }}
  */
-export function cubicBezierToVelocity(x1, y1, x2, y2) {
+export function cubicBezierToVelocity(x1, y1, x2, y2, frameDiff) {
     // Measured against Cavalry: influence is clamped to [0.01, 1] and negative speed to 0,
     // but speed has no upper bound (10 stores and animates fine). Capping it here flattened
     // every snappy curve — Ease Out Expo alone needs speed 6.25.
-    var MIN_INFLUENCE = 0.01;
+    //
+    // The floor is also frame-rate bound. Influence is a fraction of the segment, so an
+    // influence below 1/frameDiff describes a ramp narrower than one frame: Cavalry has no
+    // sample inside it and crushes the whole ramp into the final frame as a jump. Measured on
+    // a 70-frame segment, x2 = 0.991 (influence 0.009 = 0.63 frames) moved 32% of the path in
+    // one frame. Rounding up to one frame removes the jump entirely.
+    var MIN_INFLUENCE = Math.max(0.01, frameDiff > 0 ? 1 / frameDiff : 0);
     var MAX_INFLUENCE = 1.0;
     var MIN_SPEED = 0.0;
     var EPS = 0.0001;
@@ -93,18 +99,20 @@ export function cubicBezierToVelocity(x1, y1, x2, y2) {
     var rightInfluence = Math.max(MIN_INFLUENCE, Math.min(MAX_INFLUENCE, nx1));
     var leftInfluence = Math.max(MIN_INFLUENCE, Math.min(MAX_INFLUENCE, 1 - nx2));
 
+    // Speed comes off the CLAMPED influence, so the control point keeps its y and only slides
+    // in x. Dividing by the raw influence instead would move the point diagonally and change
+    // how hard the curve eases, not just where it turns.
     var rightSpeed = MIN_SPEED;
-    if (Math.abs(nx1) > EPS) {
-        var rs = y1 / nx1;
+    if (rightInfluence > EPS) {
+        var rs = y1 / rightInfluence;
         if (isFinite(rs)) {
             rightSpeed = Math.max(MIN_SPEED, rs);
         }
     }
 
-    var oneMinusX2 = 1 - nx2;
     var leftSpeed = MIN_SPEED;
-    if (Math.abs(oneMinusX2) > EPS) {
-        var ls = (1 - y2) / oneMinusX2;
+    if (leftInfluence > EPS) {
+        var ls = (1 - y2) / leftInfluence;
         if (isFinite(ls)) {
             leftSpeed = Math.max(MIN_SPEED, ls);
         }
@@ -209,9 +217,23 @@ export function calculateVelocityAtTime(t, x1, y1, x2, y2) {
  * @returns {number[]} Array of normalized velocity samples (0-1)
  */
 export function sampleVelocityCurve(x1, y1, x2, y2, sampleCount) {
+    return sampleVelocityCurveWithMax(x1, y1, x2, y2, sampleCount).samples;
+}
+
+/**
+ * As sampleVelocityCurve, but also returns the peak it divided by.
+ *
+ * The speed graph normalises each segment against its own peak, so the y axis carries no
+ * absolute meaning. Drawing a neighbouring segment beside the selected one needs a shared
+ * scale, and that means knowing the divisor rather than throwing it away. The peak is in
+ * normalized bezier units — multiply by |valueDiff / frameDiff| for real value-per-frame.
+ *
+ * @returns {{ samples: number[], max: number }}
+ */
+export function sampleVelocityCurveWithMax(x1, y1, x2, y2, sampleCount) {
     var samples = [];
     var maxSpeed = 0;
-    
+
     // First pass: calculate all speeds and find maximum
     for (var i = 0; i <= sampleCount; i++) {
         var t = i / sampleCount;
@@ -219,15 +241,70 @@ export function sampleVelocityCurve(x1, y1, x2, y2, sampleCount) {
         samples.push(speed);
         maxSpeed = Math.max(maxSpeed, speed);
     }
-    
+
     // Second pass: normalize to 0-1 range
     if (maxSpeed < 0.0001) maxSpeed = 1;
-    
-    for (var i = 0; i < samples.length; i++) {
-        samples[i] = samples[i] / maxSpeed;
+
+    for (var j = 0; j < samples.length; j++) {
+        samples[j] = samples[j] / maxSpeed;
     }
-    
-    return samples;
+
+    return { samples: samples, max: maxSpeed };
+}
+
+/**
+ * Control points for a neighbouring segment's curve, in canvas pixels.
+ *
+ * The graphs map the SELECTED segment onto the plot rect. A neighbour is drawn by extending
+ * that same linear map past the plot edges: frames are the shared x axis, values the shared
+ * y axis. So a neighbour needs no axis range of its own — only the selected segment's
+ * frameDiff and valueDiff, which set the scale.
+ *
+ * Because the previous segment covers frames before the plot's left edge and the next one
+ * frames after its right edge, neither can ever land inside the plot rect, whichever way its
+ * values run. Nothing needs clipping: the gutter bounds what is visible and the canvas edge
+ * cuts off the rest, which is what the design asks for.
+ *
+ * ui.Draw is y-up, so `endY` is the plot's BOTTOM and `startY` its top — the same inverted
+ * naming drawCurve uses.
+ *
+ * @param {string} side - "prev" or "next"
+ * @param {Object} sel - selected segment {frameDiff, valueDiff}
+ * @param {Object} seg - neighbour segment {frameDiff, valueDiff, easing:{x1,y1,x2,y2}}
+ * @param {Object} bounds - {startX, startY, endX, endY} plot rectangle
+ * @returns {{p0:number[], cp1:number[], cp2:number[], p3:number[]}|null} null if unmappable
+ */
+export function neighbourCurveControlPoints(side, sel, seg, bounds) {
+    if (!sel || !seg || !seg.easing) return null;
+    if (!(sel.frameDiff > 0) || Math.abs(sel.valueDiff) < 0.001) return null;
+    if (!(seg.frameDiff > 0)) return null;
+
+    var scaleX = (bounds.endX - bounds.startX) / sel.frameDiff;
+    var scaleY = (bounds.startY - bounds.endY) / sel.valueDiff;
+
+    var spanX = seg.frameDiff * scaleX;
+    var spanY = seg.valueDiff * scaleY;
+
+    // The neighbour is anchored at the shared keyframe — the plot corner it meets — and
+    // extends away from the plot. "prev" ends where the selection begins; "next" begins
+    // where it ends.
+    var originX, originY;
+    if (side === "prev") {
+        originX = bounds.startX - spanX;
+        originY = bounds.endY - spanY;
+    } else {
+        originX = bounds.endX;
+        originY = bounds.startY;
+    }
+
+    var e = seg.easing;
+
+    return {
+        p0: [originX, originY],
+        cp1: [originX + e.x1 * spanX, originY + e.y1 * spanY],
+        cp2: [originX + e.x2 * spanX, originY + e.y2 * spanY],
+        p3: [originX + spanX, originY + spanY]
+    };
 }
 
 /**
