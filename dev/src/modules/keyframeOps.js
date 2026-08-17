@@ -2,6 +2,7 @@
 // Functions for extracting and applying easing to keyframes
 
 import { cubicBezierToCavalry, cavalryToCubicBezier, cubicBezierToVelocity, velocityToCubicBezier, getCompositionFrameRate, framesToMilliseconds } from './conversions.js';
+import { buildArcTable, arcAt, arcInverse, projectToPath, easeAt, fitEase, sharedTangentOffset } from './pathSolve.js';
 
 var DEFAULT_LEFT_SPEED = 0.0;
 var DEFAULT_LEFT_INFLUENCE = 0.333;
@@ -48,6 +49,16 @@ function getSiblingKeyframeTimesSet(layerId, attrId) {
  * True when Cavalry evaluates this segment from speed + influence rather than from the
  * bezier handles. Handles are only honoured while both bounding speeds are 1; attributes
  * with no speed data at all (everything that isn't a motion path) are always handle-driven.
+ *
+ * Deliberately does NOT check whether this is still a motion path. Speed fields outlive the
+ * path that created them — delete one position channel and the survivor keeps them — and the
+ * obvious repair is to gate on the sibling axis and fall back to the handles. Measured, that
+ * is wrong: Cavalry renders from the speed fields whenever they are present, sibling channel
+ * or not. A probe layer with only position.x keyed reproduced a real orphaned segment's
+ * motion to four decimal places from speed + influence, while the same handles alone gave a
+ * visibly different curve. So presence of the fields IS the correct test, and the sibling
+ * check belongs only in the write path, where it decides what kind of easing to author.
+ *
  * @param {Object} frameZeroData - key data at the start of the segment
  * @param {Object} frameEndData - key data at the end of the segment
  */
@@ -175,7 +186,7 @@ function unlockKeyframePair(keyframeIdA, keyframeIdB, frameA, frameB, attrId, la
 
 var TANGENT_MODE_SPEED = 1.0;
 var TANGENT_SPEED_EPSILON = 0.0001;
-var STRAIGHT_PATH_TOLERANCE_FRACTION = 0.005;   // 0.5% of the segment's chord length
+var STRAIGHT_PATH_TOLERANCE_FRACTION = 0.01;    // 1% of the segment's chord length
 var STRAIGHT_PATH_TOLERANCE_MIN = 0.5;          // units, floor for very short moves
 var STRAIGHT_PATH_SAMPLES = 9;
 
@@ -259,6 +270,278 @@ function applyTangentEasingToPathSegment(layerId, frameA, frameB, valueAX, value
     });
 }
 
+var SOLVE_SAMPLES = 12;         // frames probed per solver pass, spread across the segment
+// Pre-distortion rounds. Measured on a hard case (a 3000-unit S-curve eased with
+// cubic-bezier(0.458, 0.146, 0.991, 0.472)): rms 0.116 → 0.033 by pass 4, then a bounce as
+// the fit hits the influence ceiling, then down to 0.012 by pass 10. Ten passes is ~120
+// setFrame calls per segment, which is imperceptible; stopping at four leaves it 3x worse.
+var SOLVE_PASSES = 10;
+var SOLVE_TOLERANCE = 0.01;     // rms distance error, as a fraction of the segment's length
+
+/**
+ * The segment's spatial cubic, in world XY. Cavalry keeps the motion path's shape in the
+ * keyframes' bezier handles: the handle's y component on position.x is the handle's X offset
+ * in the scene, and likewise for position.y. Returns null when either keyframe is missing
+ * data, which puts the caller back on the direct conversion.
+ */
+function motionPathControlPoints(layerId, frameA, frameB, startX, startY, endX, endY) {
+    function handles(frame) {
+        var out = {};
+        var axes = ['position.x', 'position.y'];
+        for (var a = 0; a < axes.length; a++) {
+            var times = api.getKeyframeTimes(layerId, axes[a]);
+            var ids = api.getKeyframeIdsForAttribute(layerId, axes[a]);
+            var index = times.indexOf(frame);
+            if (index === -1 || !ids[index]) {
+                return null;
+            }
+            var data = api.get(ids[index], 'data');
+            if (!data) {
+                return null;
+            }
+            out[axes[a]] = data;
+        }
+        return out;
+    }
+
+    try {
+        var a = handles(frameA);
+        var b = handles(frameB);
+        if (!a || !b) {
+            return null;
+        }
+        var outX = a['position.x'].rightBez, outY = a['position.y'].rightBez;
+        var inX = b['position.x'].leftBez, inY = b['position.y'].leftBez;
+        if (!outX || !outY || !inX || !inY) {
+            return null;
+        }
+        return [
+            [startX, startY],
+            [startX + outX.y, startY + outY.y],
+            [endX + inX.y, endY + inY.y],
+            [endX, endY]
+        ];
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Find the speed/influence that makes a curved motion path segment travel its DISTANCE on the
+ * requested easing curve, rather than its bezier parameter.
+ *
+ * Two distortions sit between what we ask for and what renders. The path's own geometry
+ * redistributes distance across the parameter, and Cavalry's speed/influence does not map onto
+ * a cubic-bezier the way the direct conversion assumes. Rather than model either, ask, measure
+ * what actually rendered, and push the request further by whatever it fell short — three or
+ * four rounds of that converges, and it stays correct if Cavalry's internals change.
+ *
+ * Returns the residual rms as a fraction of the segment's length, or null if it could not run.
+ */
+function solveMotionPathSegment(layerId, frameA, frameB, startX, startY, endX, endY, currentEasing, velocityByFrame) {
+    var points = motionPathControlPoints(layerId, frameA, frameB, startX, startY, endX, endY);
+    if (!points) {
+        return null;
+    }
+    var table = buildArcTable(points);
+    if (!(table.total > 0)) {
+        return null;
+    }
+
+    var frameDiff = frameB - frameA;
+    var minInfluence = Math.max(0.01, 1 / frameDiff);
+    var sampleCount = Math.min(SOLVE_SAMPLES, Math.max(2, frameDiff - 1));
+
+    // Probe frames strictly inside the segment. The endpoints carry no information — every
+    // candidate hits them exactly — and including them flatters the error.
+    var times = [];
+    var probeFrames = [];
+    for (var s = 1; s <= sampleCount; s++) {
+        var frame = frameA + Math.round((frameDiff * s) / (sampleCount + 1));
+        probeFrames.push(frame);
+        times.push((frame - frameA) / frameDiff);
+    }
+
+    // What the user asked for, as a fraction of the distance travelled.
+    var wanted = times.map(function (t) {
+        return easeAt(t, currentEasing.x1, currentEasing.y1, currentEasing.x2, currentEasing.y2);
+    });
+
+    var ask = wanted.slice();
+    var best = null;
+    var seed = null;
+
+    for (var pass = 0; pass < SOLVE_PASSES; pass++) {
+        // Convert the distance we want into the path parameter that reaches it, then find the
+        // easing curve that follows those parameters.
+        var wantParam = ask.map(function (fraction) {
+            return arcInverse(table, Math.max(0, Math.min(1, fraction)));
+        });
+        var fitted = fitEase(times, wantParam, minInfluence, seed);
+        seed = fitted;
+
+        var candidate = {
+            rightInfluence: Math.max(minInfluence, Math.min(1, fitted.x1)),
+            leftInfluence: Math.max(minInfluence, Math.min(1, 1 - fitted.x2))
+        };
+        candidate.rightSpeed = Math.max(0, fitted.y1 / candidate.rightInfluence);
+        candidate.leftSpeed = Math.max(0, (1 - fitted.y2) / candidate.leftInfluence);
+
+        writeSegmentVelocity(layerId, frameA, frameB, candidate, velocityByFrame);
+
+        // Measure what actually rendered, projecting each sampled position back onto the path.
+        var achieved = [];
+        for (var i = 0; i < probeFrames.length; i++) {
+            api.setFrame(probeFrames[i]);
+            var u = projectToPath(points, [api.get(layerId, 'position.x'), api.get(layerId, 'position.y')]);
+            achieved.push(arcAt(table, u));
+        }
+
+        var sum = 0;
+        for (var e = 0; e < achieved.length; e++) {
+            sum += (achieved[e] - wanted[e]) * (achieved[e] - wanted[e]);
+        }
+        var rms = Math.sqrt(sum / achieved.length);
+
+        if (!best || rms < best.rms) {
+            best = { rms: rms, velocity: candidate };
+        }
+        if (rms <= SOLVE_TOLERANCE) {
+            break;
+        }
+
+        // Fell short by (wanted - achieved), so ask for that much more next round.
+        for (var k = 0; k < ask.length; k++) {
+            ask[k] = Math.max(0, Math.min(1, ask[k] + (wanted[k] - achieved[k])));
+        }
+    }
+
+    writeSegmentVelocity(layerId, frameA, frameB, best.velocity, velocityByFrame);
+    return best.rms;
+}
+
+/** Stage one candidate onto the run's velocity map and push it to Cavalry. */
+function writeSegmentVelocity(layerId, frameA, frameB, candidate, velocityByFrame) {
+    velocityByFrame[frameA].rightSpeed = candidate.rightSpeed;
+    velocityByFrame[frameA].rightInfluence = candidate.rightInfluence;
+    velocityByFrame[frameB].leftSpeed = candidate.leftSpeed;
+    velocityByFrame[frameB].leftInfluence = candidate.leftInfluence;
+    [frameA, frameB].forEach(function (frame) {
+        var v = velocityByFrame[frame];
+        try {
+            api.setKeyframeVelocity(layerId, {
+                'position.x': {
+                    frame: frame,
+                    leftSpeed: v.leftSpeed,
+                    rightSpeed: v.rightSpeed,
+                    leftInfluence: v.leftInfluence,
+                    rightInfluence: v.rightInfluence
+                },
+                'position.y': {
+                    frame: frame,
+                    leftSpeed: v.leftSpeed,
+                    rightSpeed: v.rightSpeed,
+                    leftInfluence: v.leftInfluence,
+                    rightInfluence: v.rightInfluence
+                }
+            });
+        } catch (e) {}
+    });
+}
+
+/**
+ * Re-sync the temporal component of a motion path run's bezier handles across both position
+ * channels. See sharedTangentOffset for why they must match and how Cavalry splits them.
+ *
+ * Only handles that govern a segment INSIDE the run are touched: the run's leading in-handle
+ * and trailing out-handle belong to segments the user did not select, and a keyframe's two
+ * handles are independent, so leaving them alone leaves the neighbouring segments untouched.
+ * Each channel keeps its own bez.y — that is the spatial offset, the shape the user drew. Only
+ * the clock is rewritten, which is what makes the render agree with the handles already on
+ * screen rather than moving the path somewhere new.
+ *
+ * @returns {Array<string>} descriptions of what was repaired, for logging
+ */
+function repairMotionPathTangents(layerId, frames, valuesX, valuesY) {
+    var repaired = [];
+    var data = {};
+
+    function keyframeData(attrId, frame) {
+        var cacheKey = attrId + '@' + frame;
+        if (data[cacheKey] !== undefined) {
+            return data[cacheKey];
+        }
+        var result = null;
+        try {
+            var times = api.getKeyframeTimes(layerId, attrId);
+            var ids = api.getKeyframeIdsForAttribute(layerId, attrId);
+            var index = times.indexOf(frame);
+            if (index !== -1 && ids[index]) {
+                result = api.get(ids[index], 'data') || null;
+            }
+        } catch (e) {}
+        data[cacheKey] = result;
+        return result;
+    }
+
+    // An out-handle governs the segment ahead of its keyframe, an in-handle the segment behind.
+    for (var i = 0; i < frames.length; i++) {
+        var sides = [];
+        if (i < frames.length - 1) {
+            sides.push({ side: 'out', frameDiff: frames[i + 1] - frames[i] });
+        }
+        if (i > 0) {
+            sides.push({ side: 'in', frameDiff: frames[i] - frames[i - 1] });
+        }
+
+        for (var s = 0; s < sides.length; s++) {
+            var isOut = sides[s].side === 'out';
+            var frame = frames[i];
+            var dataX = keyframeData('position.x', frame);
+            var dataY = keyframeData('position.y', frame);
+            if (!dataX || !dataY) {
+                continue;
+            }
+            var handleX = isOut ? dataX.rightBez : dataX.leftBez;
+            var handleY = isOut ? dataY.rightBez : dataY.leftBez;
+            if (!handleX || !handleY) {
+                continue;
+            }
+
+            var shared = sharedTangentOffset(handleX.x, handleY.x, sides[s].frameDiff);
+            if (shared === null) {
+                continue;
+            }
+
+            var axes = [
+                { attrId: 'position.x', value: valuesX[i], handle: handleX },
+                { attrId: 'position.y', value: valuesY[i], handle: handleY }
+            ];
+            for (var a = 0; a < axes.length; a++) {
+                var write = {};
+                write[axes[a].attrId] = {
+                    frame: frame,
+                    xValue: frame + shared,
+                    yValue: axes[a].value + axes[a].handle.y,
+                    angleLocked: false,
+                    weightLocked: false
+                };
+                write[axes[a].attrId][isOut ? 'outHandle' : 'inHandle'] = true;
+                try {
+                    api.modifyKeyframeTangent(layerId, write);
+                } catch (e) {}
+            }
+
+            repaired.push(
+                'frame ' + frame + ' ' + sides[s].side + ' (' +
+                handleX.x.toFixed(2) + ' / ' + handleY.x.toFixed(2) + ' -> ' + shared.toFixed(2) + ')'
+            );
+        }
+    }
+
+    return repaired;
+}
+
 /**
  * Apply easing via setKeyframeVelocity for a contiguous motion-path run (both position.x and position.y).
  */
@@ -277,6 +560,22 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
         valuesY.push(api.get(layerId, 'position.y'));
     }
     api.setFrame(savedFrame);
+
+    // Before measuring anything: a run whose channels have drifted apart renders a path that
+    // does not follow its own handles, and the solver would happily fit correct easing to that
+    // broken shape. Re-sync first so everything downstream measures the real path.
+    try {
+        var repairs = repairMotionPathTangents(layerId, frames, valuesX, valuesY);
+        if (repairs.length) {
+            console.log(
+                'Repaired ' + repairs.length + ' desynced motion path tangent(s) — ' +
+                'position.x and position.y had drifted onto different timings, which kinks the ' +
+                'path. ' + repairs.join(', ')
+            );
+        }
+    } catch (repairError) {
+        console.log('Motion path tangent repair failed:', repairError.message);
+    }
 
     var velocityByFrame = {};
     for (var i = 0; i < n; i++) {
@@ -326,16 +625,43 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
             flattenHandlesBetweenPair(layerId, 'position.x', f0, f1);
             flattenHandlesBetweenPair(layerId, 'position.y', f0, f1);
         } else {
-            var v = cubicBezierToVelocity(
-                currentEasing.x1,
-                currentEasing.y1,
-                currentEasing.x2,
-                currentEasing.y2
-            );
-            velocityByFrame[f0].rightSpeed = v.rightSpeed;
-            velocityByFrame[f0].rightInfluence = v.rightInfluence;
-            velocityByFrame[f1].leftSpeed = v.leftSpeed;
-            velocityByFrame[f1].leftInfluence = v.leftInfluence;
+            // Curved path: what the eye reads as easing is distance over time, and a curved
+            // segment does not spread its distance evenly across its bezier parameter. Solve
+            // against the distance actually rendered rather than converting the curve blind.
+            var residual = null;
+            try {
+                residual = solveMotionPathSegment(
+                    layerId, f0, f1,
+                    valuesX[j], valuesY[j],
+                    valuesX[j + 1], valuesY[j + 1],
+                    currentEasing, velocityByFrame
+                );
+            } catch (solveError) {
+                console.log('Motion path solve failed at frame ' + f0 + ':', solveError.message);
+            }
+
+            if (residual === null) {
+                var v = cubicBezierToVelocity(
+                    currentEasing.x1,
+                    currentEasing.y1,
+                    currentEasing.x2,
+                    currentEasing.y2,
+                    f1 - f0
+                );
+                velocityByFrame[f0].rightSpeed = v.rightSpeed;
+                velocityByFrame[f0].rightInfluence = v.rightInfluence;
+                velocityByFrame[f1].leftSpeed = v.leftSpeed;
+                velocityByFrame[f1].leftInfluence = v.leftInfluence;
+            } else if (residual > SOLVE_TOLERANCE * 3) {
+                // The four speed/influence values cannot express every warp a path's geometry
+                // can impose. Say so rather than leaving the user to wonder why one segment
+                // still drifts from the curve they picked.
+                console.log(
+                    'Frames ' + f0 + '-' + f1 + ': path geometry limits how closely the easing can be ' +
+                    'matched (off by ' + Math.round(residual * 100) + '% of the segment). Shortening the ' +
+                    'motion path handles will improve it.'
+                );
+            }
         }
     }
     api.setFrame(savedFrame);   // straightness sampling scrubs the timeline
@@ -421,6 +747,139 @@ function handleIsFlat(layerId, attrId, frame, side) {
     } catch (e) {
         return false;
     }
+}
+
+/**
+ * Strip the stale speed + influence off a position channel that is no longer a motion path.
+ *
+ * Speed fields outlive the path that created them: delete one position channel and the
+ * survivor keeps them, and Cavalry goes on evaluating those segments from speed rather than
+ * from their handles. Easing written as handles then does nothing — measured on a real
+ * orphaned segment, a full Apply moved it from 0.6077 to 0.6674 at the midpoint when the
+ * handles alone called for 0.1046.
+ *
+ * The fields cannot be written away (modifyKeyframe throws on rightSpeed / rightInfluence)
+ * and cannot be neutralised (speed 1 is simply another speed, not an off switch). Deleting
+ * and recreating the keyframe is the only thing that clears them.
+ *
+ * That deletion makes Cavalry re-derive the surviving neighbours' tangents, which wrecks the
+ * segments either side: measured, the trailing neighbour went from 0.3274 to 0.0659 at its
+ * first sample. Restoring only the outer keys' handles is not enough — a segment is bound by
+ * a handle at BOTH ends, so the recreated keys' outward-facing handles matter just as much.
+ * Snapshotting all four and writing them back restores both neighbours exactly.
+ *
+ * Only the handles facing the orphaned segments themselves are dropped, and the caller
+ * overwrites those immediately with the easing being applied.
+ *
+ * @param {Object} group - {layerId, attrId, frames, keyframeIds}
+ * @returns {boolean} true if anything was recreated (the group's keyframeIds are now stale)
+ */
+function repairOrphanedVelocitySegments(group) {
+    var siblingTimes = getSiblingKeyframeTimesSet(group.layerId, group.attrId);
+    // null means this is not a position channel, and nothing else carries speed fields.
+    if (!siblingTimes) {
+        return false;
+    }
+
+    var times, ids;
+    try {
+        times = api.getKeyframeTimes(group.layerId, group.attrId) || [];
+        ids = api.getKeyframeIdsForAttribute(group.layerId, group.attrId) || [];
+    } catch (e) {
+        return false;
+    }
+    if (times.length < 2 || ids.length !== times.length) {
+        return false;
+    }
+
+    var data = ids.map(function (id) {
+        try { return api.get(id, 'data') || {}; } catch (e) { return {}; }
+    });
+
+    function hasSpeed(value) {
+        return value !== undefined && value !== null;
+    }
+    // A recreated keyframe comes back bare, losing its interpolation along with everything
+    // else. Dropping a hold that way would be a silent, invisible edit, so leave those alone
+    // and accept that a held orphan keeps its stale fields.
+    function isPlainBezier(d) {
+        return d.interpolation === undefined || d.interpolation === 0;
+    }
+
+    // Which segments across the WHOLE attribute are orphaned — not just the selected ones.
+    // A recreate rewrites its neighbours regardless of what the user selected, so the scan
+    // has to see the same span the damage would.
+    var orphaned = [];
+    for (var s = 0; s < times.length - 1; s++) {
+        if (isMotionPathPair(siblingTimes, times[s], times[s + 1])) continue;
+        if (!hasSpeed(data[s].rightSpeed) || !hasSpeed(data[s + 1].leftSpeed)) continue;
+        if (!isPlainBezier(data[s]) || !isPlainBezier(data[s + 1])) continue;
+        orphaned.push(s);
+    }
+    if (orphaned.length === 0) {
+        return false;
+    }
+
+    var doomed = new Set();
+    var facing = new Set();
+    orphaned.forEach(function (s) {
+        doomed.add(times[s]);
+        doomed.add(times[s + 1]);
+        // The two handles that shape the orphaned segment itself. Deliberately not restored.
+        facing.add(times[s] + '|out');
+        facing.add(times[s + 1] + '|in');
+    });
+
+    var restoreFrame = api.getFrame();
+    try {
+        // modifyKeyframeTangent takes ABSOLUTE coordinates, so each handle has to be resolved
+        // against the value at its own keyframe's frame before anything is deleted.
+        var snapshot = [];
+        var values = {};
+        for (var v = 0; v < times.length; v++) {
+            api.setFrame(times[v]);
+            values[times[v]] = api.get(group.layerId, group.attrId);
+        }
+        for (var h = 0; h < times.length; h++) {
+            var frame = times[h];
+            var base = values[frame];
+            if (data[h].leftBez && !facing.has(frame + '|in')) {
+                snapshot.push({ frame: frame, side: 'in', xv: frame + data[h].leftBez.x, yv: base + data[h].leftBez.y });
+            }
+            if (data[h].rightBez && !facing.has(frame + '|out')) {
+                snapshot.push({ frame: frame, side: 'out', xv: frame + data[h].rightBez.x, yv: base + data[h].rightBez.y });
+            }
+        }
+
+        doomed.forEach(function (frame) {
+            try { api.deleteKeyframe(group.layerId, group.attrId, frame); } catch (e) {}
+        });
+        doomed.forEach(function (frame) {
+            var payload = {};
+            payload[group.attrId] = values[frame];
+            try { api.keyframe(group.layerId, frame, payload); } catch (e) {}
+        });
+
+        snapshot.forEach(function (h2) {
+            var obj = {};
+            obj[group.attrId] = {
+                frame: h2.frame,
+                inHandle: h2.side === 'in',
+                outHandle: h2.side === 'out',
+                xValue: h2.xv,
+                yValue: h2.yv,
+                angleLocked: false,
+                weightLocked: false
+            };
+            try { api.modifyKeyframeTangent(group.layerId, obj); } catch (e) {}
+        });
+    } catch (e) {
+        console.log("Error repairing orphaned velocity segments: " + e.message);
+    } finally {
+        api.setFrame(restoreFrame);
+    }
+
+    return true;
 }
 
 /**
@@ -585,6 +1044,170 @@ function applyEasingToSingleKeyframe(keyframeId, attrId, layerId, frame, value, 
 }
 
 /**
+ * Read one segment's normalised easing from the two keyframes bounding it.
+ *
+ * Scrubs the timeline to sample the values, so the caller restores api.getFrame() once it
+ * has read everything it needs.
+ *
+ * @param {string} layerId
+ * @param {string} attrId
+ * @param {string} keyIdA - keyframe id at frameA
+ * @param {string} keyIdB - keyframe id at frameB
+ * @param {number} frameA - earlier frame
+ * @param {number} frameB - later frame
+ * @returns {{ frameDiff: number, valueDiff: number, easing: Object }|null}
+ */
+function readSegment(layerId, attrId, keyIdA, keyIdB, frameA, frameB) {
+    var frameDiff = frameB - frameA;
+    if (!keyIdA || !keyIdB || !(frameDiff > 0)) {
+        return null;
+    }
+
+    api.setFrame(frameA);
+    var firstValue = api.get(layerId, attrId);
+    api.setFrame(frameB);
+    var secondValue = api.get(layerId, attrId);
+
+    var valueDiff = secondValue - firstValue;
+
+    var firstKeyData = api.get(keyIdA, 'data');
+    var secondKeyData = api.get(keyIdB, 'data');
+    if (!firstKeyData || !secondKeyData) {
+        return null;
+    }
+
+    // Which id holds the segment's start is decided by value, not by id order.
+    var frameZeroData, frameEndData;
+    if (Math.abs(firstKeyData.numValue - firstValue) < 0.1) {
+        frameZeroData = firstKeyData;
+        frameEndData = secondKeyData;
+    } else {
+        frameZeroData = secondKeyData;
+        frameEndData = firstKeyData;
+    }
+
+    var easing;
+    if (segmentUsesVelocity(frameZeroData, frameEndData)) {
+        // Velocity-eased motion path segment: the handles are flat, the easing lives in
+        // speed + influence.
+        easing = velocityToCubicBezier(
+            frameZeroData.rightSpeed,
+            frameZeroData.rightInfluence,
+            frameEndData.leftSpeed,
+            frameEndData.leftInfluence
+        );
+    } else if (frameZeroData.rightBez && frameEndData.leftBez) {
+        easing = cavalryToCubicBezier(
+            frameZeroData.rightBez.x,
+            frameZeroData.rightBez.y,
+            frameEndData.leftBez.x,
+            frameEndData.leftBez.y,
+            frameDiff,
+            valueDiff
+        );
+    } else {
+        easing = { x1: 0, y1: 0, x2: 1, y2: 1 };
+    }
+
+    return { frameDiff: frameDiff, valueDiff: valueDiff, easing: easing };
+}
+
+/**
+ * The segments either side of the selected one, for the read-only ghost curves.
+ *
+ * Only answers when the selection is a single unambiguous segment. With several segments
+ * selected the graph shows their AVERAGE, and there is no honest neighbour for an average —
+ * better to show nothing than to imply the ghosts connect to the curve on screen.
+ *
+ * Nothing here writes. The neighbouring keyframes are read and left exactly as found.
+ *
+ * @returns {{ sel: Object, prev: Object|null, next: Object|null }|null}
+ */
+export function readNeighbourSegments() {
+    var restoreFrame = api.getFrame();
+    try {
+        var selectedKeyframes = api.getSelectedKeyframes();
+
+        // A motion path selects position.x and position.y together and they share one clock,
+        // so that pair is still one segment. Any other multi-attribute selection is not.
+        var candidates = [];
+        for (let [fullAttributePath, frames] of Object.entries(selectedKeyframes)) {
+            if (!frames || frames.length === 0) continue;
+            if (frames.length !== 2) return null;
+
+            var dotAfterHash = fullAttributePath.indexOf('.', fullAttributePath.indexOf('#'));
+            if (fullAttributePath.indexOf('#') === -1 || dotAfterHash === -1) return null;
+
+            candidates.push({
+                layerId: fullAttributePath.substring(0, dotAfterHash),
+                attrId: fullAttributePath.substring(dotAfterHash + 1),
+                frames: frames.slice().sort(function (a, b) { return a - b; })
+            });
+        }
+
+        if (candidates.length === 0) return null;
+        if (candidates.length > 1) {
+            var axes = candidates.map(function (c) { return c.attrId; }).sort();
+            var sameFrames = candidates.every(function (c) {
+                return c.frames[0] === candidates[0].frames[0] && c.frames[1] === candidates[0].frames[1];
+            });
+            var isPathPair = candidates.length === 2 &&
+                axes[0] === 'position.x' && axes[1] === 'position.y' &&
+                candidates[0].layerId === candidates[1].layerId && sameFrames;
+            if (!isPathPair) return null;
+        }
+
+        // For a motion path either axis carries the same timing, but the axis that barely
+        // moves has a valueDiff near zero, which makes its value scale meaningless. Read the
+        // axis that actually travels.
+        var chosen = candidates[0];
+        if (candidates.length > 1) {
+            var best = -Infinity;
+            for (var c = 0; c < candidates.length; c++) {
+                api.setFrame(candidates[c].frames[0]);
+                var v0 = api.get(candidates[c].layerId, candidates[c].attrId);
+                api.setFrame(candidates[c].frames[1]);
+                var v1 = api.get(candidates[c].layerId, candidates[c].attrId);
+                var travel = Math.abs(v1 - v0);
+                if (travel > best) {
+                    best = travel;
+                    chosen = candidates[c];
+                }
+            }
+        }
+
+        var times = api.getKeyframeTimes(chosen.layerId, chosen.attrId) || [];
+        var ids = api.getKeyframeIdsForAttribute(chosen.layerId, chosen.attrId) || [];
+        var startIndex = times.indexOf(chosen.frames[0]);
+        var endIndex = times.indexOf(chosen.frames[1]);
+
+        // Selecting two keyframes with others between them is not a segment either.
+        if (startIndex === -1 || endIndex !== startIndex + 1) return null;
+
+        var sel = readSegment(chosen.layerId, chosen.attrId, ids[startIndex], ids[endIndex], times[startIndex], times[endIndex]);
+        if (!sel || Math.abs(sel.valueDiff) < IDENTICAL_VALUE_EPSILON) {
+            // A hold gives no value scale to map a neighbour's values through.
+            return null;
+        }
+
+        var prev = startIndex > 0
+            ? readSegment(chosen.layerId, chosen.attrId, ids[startIndex - 1], ids[startIndex], times[startIndex - 1], times[startIndex])
+            : null;
+        var next = endIndex < times.length - 1
+            ? readSegment(chosen.layerId, chosen.attrId, ids[endIndex], ids[endIndex + 1], times[endIndex], times[endIndex + 1])
+            : null;
+
+        if (!prev && !next) return null;
+
+        return { sel: sel, prev: prev, next: next };
+    } catch (e) {
+        return null;
+    } finally {
+        api.setFrame(restoreFrame);
+    }
+}
+
+/**
  * Get easing from selected keyframes
  * @param {Object} currentEasing - Current easing state to update
  * @returns {boolean} Success status
@@ -707,66 +1330,14 @@ export function getEasingFromKeyframes(currentEasing) {
                     seenPathSegments.add(segmentKey);
                 }
 
-                api.setFrame(firstFrame);
-                var firstValue = api.get(group.layerId, group.attrId);
-                api.setFrame(secondFrame);
-                var secondValue = api.get(group.layerId, group.attrId);
-                
-                var valueDiff = secondValue - firstValue;
-                
-                var firstKeyData = api.get(currentKeyId, 'data');
-                var secondKeyData = api.get(nextKeyId, 'data');
-                
-                var frameZeroData, frameEndData;
-                if (Math.abs(firstKeyData.numValue - firstValue) < 0.1) {
-                    frameZeroData = firstKeyData;
-                    frameEndData = secondKeyData;
-                } else {
-                    frameZeroData = secondKeyData;
-                    frameEndData = firstKeyData;
-                }
-                
-                var outHandleX = null, outHandleY = null;
-                var inHandleX = null, inHandleY = null;
-                
-                if (frameZeroData && frameZeroData.rightBez) {
-                    outHandleX = frameZeroData.rightBez.x;
-                    outHandleY = frameZeroData.rightBez.y;
-                }
-                
-                if (frameEndData && frameEndData.leftBez) {
-                    inHandleX = frameEndData.leftBez.x;
-                    inHandleY = frameEndData.leftBez.y;
-                }
-                
-                if (segmentUsesVelocity(frameZeroData, frameEndData)) {
-                    // Velocity-eased motion path segment: the handles are flat, the easing
-                    // lives in speed + influence.
-                    var velocityBezier = velocityToCubicBezier(
-                        frameZeroData.rightSpeed,
-                        frameZeroData.rightInfluence,
-                        frameEndData.leftSpeed,
-                        frameEndData.leftInfluence
-                    );
-                    totalX1 += velocityBezier.x1;
-                    totalY1 += velocityBezier.y1;
-                    totalX2 += velocityBezier.x2;
-                    totalY2 += velocityBezier.y2;
-                    pairCount++;
-                } else if (outHandleX !== null && inHandleX !== null) {
-                    var bezier = cavalryToCubicBezier(outHandleX, outHandleY, inHandleX, inHandleY, frameDiff, valueDiff);
-                    totalX1 += bezier.x1;
-                    totalY1 += bezier.y1;
-                    totalX2 += bezier.x2;
-                    totalY2 += bezier.y2;
-                    pairCount++;
-                } else {
-                    totalX1 += 0;
-                    totalY1 += 0;
-                    totalX2 += 1;
-                    totalY2 += 1;
-                    pairCount++;
-                }
+                var segment = readSegment(group.layerId, group.attrId, currentKeyId, nextKeyId, firstFrame, secondFrame);
+                if (!segment) continue;
+
+                totalX1 += segment.easing.x1;
+                totalY1 += segment.easing.y1;
+                totalX2 += segment.easing.x2;
+                totalY2 += segment.easing.y2;
+                pairCount++;
             }
         }
         
@@ -893,6 +1464,30 @@ export function applyEasingToKeyframes(currentEasing) {
         var totalProcessed = 0;
         var currentFrameTime = api.getFrame();
         var velocityApplied = new Set();
+
+        // Pass 0: clear stale speed + influence off position channels that are no longer
+        // motion paths, otherwise Cavalry keeps evaluating them by speed and the handles the
+        // passes below write are ignored. Runs first because recreating a keyframe changes
+        // its id, which would strand the ids the passes iterate.
+        for (let [orphanPath, orphanGroup] of Object.entries(attributeGroups)) {
+            try {
+                if (repairOrphanedVelocitySegments(orphanGroup)) {
+                    orphanGroup.keyframeIds = keyframeIdsForFrames(
+                        orphanGroup.layerId, orphanGroup.attrId, orphanGroup.frames
+                    );
+                }
+            } catch (orphanError) {
+                console.log('Error repairing orphaned velocity for ' + orphanPath + ':', orphanError.message);
+            }
+        }
+        // A repair that could not re-resolve every id would make the passes below write to
+        // nothing, so drop those groups rather than half-applying them.
+        for (let [checkPath, checkGroup] of Object.entries(attributeGroups)) {
+            if (!checkGroup.keyframeIds.every(Boolean)) {
+                console.log('Skipping ' + checkPath + ': keyframes could not be re-resolved after repair');
+                delete attributeGroups[checkPath];
+            }
+        }
 
         // Pass 1: motion path segments use setKeyframeVelocity (both axes); avoids modifyKeyframeTangent on paths
         for (let [attributePath, group] of Object.entries(attributeGroups)) {
