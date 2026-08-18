@@ -1295,7 +1295,13 @@ function fitMotionPathEasing(layerId, frameA, frameB, frameDiff) {
     }
 
     var fitted = fitEase(times, values, Math.max(0.01, 1 / frameDiff));
-    return { x1: fitted.x1, y1: fitted.y1, x2: fitted.x2, y2: fitted.y2 };
+    // arcLength travels back with the curve because it is the quantity the curve describes:
+    // a caller placing this segment against its neighbours must scale by distance, not by a
+    // single channel's delta. See the valueDiff override in readSegment.
+    return {
+        x1: fitted.x1, y1: fitted.y1, x2: fitted.x2, y2: fitted.y2,
+        arcLength: table.total
+    };
 }
 
 /**
@@ -1423,6 +1429,16 @@ function readSegment(layerId, attrId, keyIdA, keyIdB, frameA, frameB) {
         var siblingTimes = getSiblingKeyframeTimesSet(layerId, attrId);
         if (isMotionPathPair(siblingTimes, frameA, frameB)) {
             easing = fitMotionPathEasing(layerId, frameA, frameB, frameDiff);
+            if (easing) {
+                // The curve now measures fraction of DISTANCE travelled, so the segment's
+                // span has to be that distance too. Leaving it as the channel delta mixes
+                // two quantities: measured on a real path, position.x netted -223 across a
+                // segment 2662 units long, while its neighbour netted +1222 over 1654 — so a
+                // neighbour drawn against the channel came out inverted and several plot
+                // heights tall. Distance is always positive, so neighbours also stop flipping
+                // when the layer doubles back.
+                valueDiff = easing.arcLength;
+            }
         }
 
         // A curve Easey itself authored needs no fitting: the exact numbers are known. Fitting
