@@ -18,6 +18,10 @@ var _clampHoldsEnabled = true;
 // against ~120ms at 60.
 var VELOCITY_FIT_SAMPLES = 10;
 
+// Probes across a segment to decide whether the sibling position channel is moving at all.
+// Endpoints alone would miss a sibling that departs and returns within the span.
+var SIBLING_MOTION_SAMPLES = 6;
+
 // Fits from the last read, keyed by segment, each holding the curve that was fitted and the
 // speed/influence it was fitted from. Lets Apply put a segment back exactly as found when the
 // user never touched its curve — see restoreUneditedVelocity.
@@ -767,6 +771,98 @@ function handleIsFlat(layerId, attrId, frame, side) {
         return Math.abs(handle.x) < 0.001 && Math.abs(handle.y) < 0.001;
     } catch (e) {
         return false;
+    }
+}
+
+/**
+ * True when the two position channels are not keyed identically across a segment's span.
+ *
+ * Easing a motion path only works while both channels share one clock. Two ways that breaks,
+ * both measured:
+ *
+ *   - the sibling is keyed somewhere but not at this segment's frames, so isMotionPathPair
+ *     says "not a path" and the tangent pass writes this channel alone;
+ *   - the sibling carries an EXTRA key inside the segment, which isMotionPathPair happily
+ *     calls a pair — the velocity pass then writes the outer frames of both channels and
+ *     leaves that inner key untouched. Measured on x[0,60] against y[0,30,60]: at frame 30
+ *     position.x had raced to 514 while position.y sat pinned at 400 by its own key.
+ *
+ * Either way the channels end up on different timings and the path's shape changes. Comparing
+ * the times themselves catches both, where checking only the endpoints catches only the first.
+ *
+ * @returns {boolean} true when applying easing here would distort the path
+ */
+function motionPathChannelsDisagree(layerId, attrId, frameA, frameB) {
+    if (attrId !== 'position.x' && attrId !== 'position.y') {
+        return false;
+    }
+    var sibling = attrId === 'position.x' ? 'position.y' : 'position.x';
+
+    var own, sib;
+    try {
+        own = api.getKeyframeTimes(layerId, attrId) || [];
+        sib = api.getKeyframeTimes(layerId, sibling) || [];
+    } catch (e) {
+        return false;
+    }
+    // No sibling keys at all is a single-channel move, not a motion path. That case is the
+    // deliberate one — Pass 0 converts it to handles — and needs no warning.
+    if (sib.length === 0) {
+        return false;
+    }
+
+    function spanKey(times) {
+        return times
+            .filter(function (t) { return t >= frameA && t <= frameB; })
+            .sort(function (a, b) { return a - b; })
+            .join(',');
+    }
+    if (spanKey(own) === spanKey(sib)) {
+        return false;
+    }
+
+    // Mismatched times alone are not enough. A sibling keyed only outside this span may be
+    // sitting still through it, and easing one channel against a static other channel is a
+    // straight-line move, not a desync — warning there would be noise. Equally, a sibling
+    // keyed at -30 and 90 IS animating across 0-60 despite having no keys inside it, so the
+    // question is whether it moves, not whether it is keyed.
+    var restore = api.getFrame();
+    try {
+        var first = null;
+        for (var s = 0; s <= SIBLING_MOTION_SAMPLES; s++) {
+            api.setFrame(Math.round(frameA + (s / SIBLING_MOTION_SAMPLES) * (frameB - frameA)));
+            var value = api.get(layerId, sibling);
+            if (first === null) {
+                first = value;
+            } else if (!valuesAreIdentical(first, value)) {
+                return true;
+            }
+        }
+    } catch (e) {
+        // Could not sample — assume it matters rather than stay quiet about a possible desync.
+        return true;
+    } finally {
+        api.setFrame(restore);
+    }
+    return false;
+}
+
+/**
+ * Ask before distorting a motion path. Returns true to proceed.
+ * Falls through to a log if no modal is available, rather than silently blocking an Apply.
+ */
+function confirmMotionPathDesync(segments) {
+    var body =
+        'position.x and position.y are keyed at different frames across ' +
+        (segments.length === 1 ? 'this segment:' : 'these segments:') + '\n\n' +
+        segments.join('\n') + '\n\n' +
+        'Both channels must share one timing for the path to hold its shape, so easing this ' +
+        'will change where the layer travels, not just how fast.\n\nApply anyway?';
+    try {
+        return new ui.Modal().showConfirmation('Motion path will be distorted', body);
+    } catch (e) {
+        console.log('Motion path channels disagree at: ' + segments.join(', '));
+        return true;
     }
 }
 
@@ -1673,6 +1769,30 @@ export function applyEasingToKeyframes(currentEasing) {
         var totalProcessed = 0;
         var currentFrameTime = api.getFrame();
         var velocityApplied = new Set();
+
+        // Before anything writes: a segment whose two position channels are keyed differently
+        // cannot be eased without moving the path itself. Ask once for the whole Apply rather
+        // than per segment, and abort entirely on cancel so nothing is half-applied.
+        var desynced = [];
+        var desyncSeen = new Set();
+        for (let [warnPath, warnGroup] of Object.entries(attributeGroups)) {
+            for (var wi = 0; wi < warnGroup.frames.length - 1; wi++) {
+                var wa = warnGroup.frames[wi];
+                var wb = warnGroup.frames[wi + 1];
+                if (!motionPathChannelsDisagree(warnGroup.layerId, warnGroup.attrId, wa, wb)) {
+                    continue;
+                }
+                // Selecting both axes would otherwise report the same segment twice.
+                var desyncKey = warnGroup.layerId + '|' + wa + '|' + wb;
+                if (desyncSeen.has(desyncKey)) continue;
+                desyncSeen.add(desyncKey);
+                desynced.push(api.getNiceName(warnGroup.layerId) + '  frames ' + wa + '-' + wb);
+            }
+        }
+        if (desynced.length && !confirmMotionPathDesync(desynced)) {
+            console.log('Apply cancelled — motion path would have been distorted.');
+            return false;
+        }
 
         // Pass 0: clear stale speed + influence off position channels that are no longer
         // motion paths, otherwise Cavalry keeps evaluating them by speed and the handles the
