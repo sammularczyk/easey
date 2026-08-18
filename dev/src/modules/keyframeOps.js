@@ -714,6 +714,39 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
             console.log('Error setKeyframeVelocity at frame ' + fr + ':', e.message);
         }
     }
+
+    // Record what was authored, so a later Get hands these exact numbers back instead of
+    // re-deriving them. Fitting the rendered motion is the honest answer for a curve Easey
+    // did not write, but for one it did the answer is already known — and the fit, being a
+    // local search over a family where many parameter sets describe the same curve, will not
+    // land on the numbers the user typed.
+    for (var sIdx = 0; sIdx < n - 1; sIdx++) {
+        var segA = frames[sIdx];
+        var segB = frames[sIdx + 1];
+        var vA = velocityByFrame[segA];
+        var vB = velocityByFrame[segB];
+        if (!vA || !vB) {
+            continue;
+        }
+        if (Object.keys(_velocityFits).length > VELOCITY_FIT_CACHE_MAX) {
+            _velocityFits = {};
+        }
+        var record = {
+            easing: {
+                x1: currentEasing.x1, y1: currentEasing.y1,
+                x2: currentEasing.x2, y2: currentEasing.y2
+            },
+            velocity: {
+                rightSpeed: vA.rightSpeed,
+                rightInfluence: vA.rightInfluence,
+                leftSpeed: vB.leftSpeed,
+                leftInfluence: vB.leftInfluence
+            }
+        };
+        // Both channels share one clock, and the read path looks up whichever it is holding.
+        _velocityFits[velocityFitKey(layerId, 'position.x', segA, segB)] = record;
+        _velocityFits[velocityFitKey(layerId, 'position.y', segA, segB)] = record;
+    }
 }
 
 function velocityRunKey(layerId, frame) {
@@ -1309,9 +1342,25 @@ export function velocityFitIsUnedited(entry, currentEasing, live0, live1) {
 
     // The scene can move under a cached fit — edited in Cavalry's own graph editor, undone,
     // rebuilt. Only trust it while the keyframes still hold what it was measured from.
-    var v = entry.velocity;
-    return live0.rightSpeed === v.rightSpeed && live0.rightInfluence === v.rightInfluence &&
-           live1.leftSpeed === v.leftSpeed && live1.leftInfluence === v.leftInfluence;
+    return sameSegmentVelocity(entry.velocity, {
+        rightSpeed: live0.rightSpeed,
+        rightInfluence: live0.rightInfluence,
+        leftSpeed: live1.leftSpeed,
+        leftInfluence: live1.leftInfluence
+    });
+}
+
+/**
+ * Whether two segments carry identical speed + influence on the halves that shape them.
+ * The start key's incoming side and the end key's outgoing side belong to the neighbouring
+ * segments and are deliberately ignored.
+ */
+export function sameSegmentVelocity(a, b) {
+    if (!a || !b) {
+        return false;
+    }
+    return a.rightSpeed === b.rightSpeed && a.rightInfluence === b.rightInfluence &&
+           a.leftSpeed === b.leftSpeed && a.leftInfluence === b.leftInfluence;
 }
 
 /**
@@ -1374,6 +1423,18 @@ function readSegment(layerId, attrId, keyIdA, keyIdB, frameA, frameB) {
         var siblingTimes = getSiblingKeyframeTimesSet(layerId, attrId);
         if (isMotionPathPair(siblingTimes, frameA, frameB)) {
             easing = fitMotionPathEasing(layerId, frameA, frameB, frameDiff);
+        }
+
+        // A curve Easey itself authored needs no fitting: the exact numbers are known. Fitting
+        // would answer with a different-looking set that describes the same motion — measured,
+        // applying 0.486, 0, 0.884, 0.37 read back as 0.623, 0.031, 0.922, 0.522, both within
+        // 2% of the same path. Correct, but unsettling to type one number and read another.
+        var cached = _velocityFits[velocityFitKey(layerId, attrId, frameA, frameB)];
+        if (cached && sameSegmentVelocity(cached.velocity, velocity)) {
+            easing = {
+                x1: cached.easing.x1, y1: cached.easing.y1,
+                x2: cached.easing.x2, y2: cached.easing.y2
+            };
         }
 
         if (!easing) {
@@ -1515,9 +1576,6 @@ export function readNeighbourSegments() {
  * @returns {boolean} Success status
  */
 export function getEasingFromKeyframes(currentEasing) {
-    // Fits only need to survive until the matching Apply, and a stale one from an earlier
-    // selection must never be mistaken for this one's.
-    _velocityFits = {};
     try {
         var selectedKeyframes = api.getSelectedKeyframes();
         var keyframeIds = api.getSelectedKeyframeIds();

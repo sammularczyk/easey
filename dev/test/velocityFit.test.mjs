@@ -78,3 +78,35 @@ assert.equal(velocityFitIsUnedited(entry, { ...easing }, undefined, live1()), fa
 assert.equal(velocityFitIsUnedited(entry, null, live0(), live1()), false, "missing easing");
 
 console.log("velocityFit: ok");
+
+// --- sameSegmentVelocity: the guard behind BOTH round-trip directions ---
+// Get -> Apply restores the original velocity when the curve is untouched; Apply -> Get hands
+// back the authored curve when the velocity is untouched. Both hinge on this comparison, so
+// it has to be exact about the halves that matter and blind to the halves that don't.
+
+const { sameSegmentVelocity } = await import("../src/modules/keyframeOps.js");
+
+const v = () => ({ rightSpeed: 2.5, rightInfluence: 0.35, leftSpeed: 0, leftInfluence: 0.6 });
+
+assert.equal(sameSegmentVelocity(v(), v()), true, "identical velocity matches");
+
+for (const key of ["rightSpeed", "rightInfluence", "leftSpeed", "leftInfluence"]) {
+    const changed = { ...v(), [key]: v()[key] + 1e-9 };
+    assert.equal(
+        sameSegmentVelocity(v(), changed),
+        false,
+        `a nudge to ${key} breaks the match`
+    );
+}
+
+// Extra keys are the neighbours' halves — they must not participate.
+assert.equal(
+    sameSegmentVelocity(v(), { ...v(), leftSpeedOfNeighbour: 99 }),
+    true,
+    "unrelated fields are ignored"
+);
+
+assert.equal(sameSegmentVelocity(null, v()), false, "null declines");
+assert.equal(sameSegmentVelocity(v(), undefined), false, "undefined declines");
+
+console.log("sameSegmentVelocity: ok");
