@@ -1413,6 +1413,36 @@ function readSegment(layerId, attrId, keyIdA, keyIdB, frameA, frameB) {
     }
 
     var easing;
+
+    // A motion path is measured by DISTANCE whichever way Cavalry happens to evaluate it.
+    //
+    // Two reasons, and the second is easy to miss. A single channel is not progress on a
+    // curved path — it can run backwards and overshoot its own endpoints while the layer only
+    // ever moves forwards. And the bezier handles do not hold timing at all here: Cavalry
+    // reuses rightBez.y on position.x to store the handle's scene-X offset, so reading it as
+    // a value produced x1=0.717, y1=0, x2=0.735, y2=1.235 on a real segment — y2 above 1 from
+    // a curve that never overshoots.
+    //
+    // Doing this outside the velocity branch matters. A straight path segment carries speed 1
+    // on both sides (see applyTangentEasingToPathSegment), so it is NOT velocity-driven and
+    // used to fall through to the handles, keeping a channel-delta valueDiff while its
+    // neighbours reported arc length. Measured: the selected segment netted -19.2 in x while
+    // its neighbours spanned thousands of units, so the ghosts were scaled by plotHeight/-19.2
+    // and drawn hundreds of plot-heights tall — of which the visible sliver looked like a
+    // straight line.
+    var isPathPair = isMotionPathPair(getSiblingKeyframeTimesSet(layerId, attrId), frameA, frameB);
+    if (isPathPair) {
+        var pathFit = fitMotionPathEasing(layerId, frameA, frameB, frameDiff);
+        if (pathFit) {
+            easing = pathFit;
+            // The curve now measures fraction of distance travelled, so the segment's span
+            // has to be that distance too, or a neighbour drawn against it mixes two
+            // quantities. Distance is always positive, so ghosts also stop flipping when the
+            // layer doubles back.
+            valueDiff = pathFit.arcLength;
+        }
+    }
+
     if (segmentUsesVelocity(frameZeroData, frameEndData)) {
         // Velocity-eased segment: the handles are flat and the easing lives in speed +
         // influence, which does not convert faithfully — so measure the motion instead.
@@ -1422,24 +1452,6 @@ function readSegment(layerId, attrId, keyIdA, keyIdB, frameA, frameB) {
             leftSpeed: frameEndData.leftSpeed,
             leftInfluence: frameEndData.leftInfluence
         };
-
-        // On a curved path a single channel is not progress — it can run backwards and
-        // overshoot its own endpoints while the layer only ever moves forwards along the
-        // path. Measure distance travelled instead whenever both channels are keyed here.
-        var siblingTimes = getSiblingKeyframeTimesSet(layerId, attrId);
-        if (isMotionPathPair(siblingTimes, frameA, frameB)) {
-            easing = fitMotionPathEasing(layerId, frameA, frameB, frameDiff);
-            if (easing) {
-                // The curve now measures fraction of DISTANCE travelled, so the segment's
-                // span has to be that distance too. Leaving it as the channel delta mixes
-                // two quantities: measured on a real path, position.x netted -223 across a
-                // segment 2662 units long, while its neighbour netted +1222 over 1654 — so a
-                // neighbour drawn against the channel came out inverted and several plot
-                // heights tall. Distance is always positive, so neighbours also stop flipping
-                // when the layer doubles back.
-                valueDiff = easing.arcLength;
-            }
-        }
 
         // A curve Easey itself authored needs no fitting: the exact numbers are known. Fitting
         // would answer with a different-looking set that describes the same motion — measured,
@@ -1475,7 +1487,7 @@ function readSegment(layerId, attrId, keyIdA, keyIdB, frameA, frameB) {
                 velocity.leftInfluence
             );
         }
-    } else if (frameZeroData.rightBez && frameEndData.leftBez) {
+    } else if (!isPathPair && frameZeroData.rightBez && frameEndData.leftBez) {
         easing = cavalryToCubicBezier(
             frameZeroData.rightBez.x,
             frameZeroData.rightBez.y,
@@ -1484,7 +1496,7 @@ function readSegment(layerId, attrId, keyIdA, keyIdB, frameA, frameB) {
             frameDiff,
             valueDiff
         );
-    } else {
+    } else if (!easing) {
         easing = { x1: 0, y1: 0, x2: 1, y2: 1 };
     }
 
