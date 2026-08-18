@@ -316,3 +316,127 @@ export function neighbourCurveControlPoints(side, sel, seg, bounds) {
 export function framesToMilliseconds(frames, frameRate) {
     return Math.round((frames / frameRate) * 1000);
 }
+
+/**
+ * Rotate one of the selected segment's handles to leave along a neighbour's tangent.
+ *
+ * A join reads as smooth when the SPEED matches across it, and speed is dValue/dFrame — the
+ * slope. A bezier's endpoint tangent is 3(P1 - P0), so slope depends only on the handle's
+ * DIRECTION; its length cancels. Matching the angle therefore matches the speed exactly, and
+ * the length is free to stay as the user set it. That is why this rotates and never rescales.
+ *
+ * Ghost points arrive already mapped through the selected segment's own axes (see
+ * neighbourCurveControlPoints), so working in pixels here is working in shared value/frame
+ * units — no conversion needed.
+ *
+ * @param {string} side - "prev" rotates the outgoing handle, "next" the incoming one
+ * @param {Object} points - the ghost's {p0, cp1, cp2, p3} in canvas pixels
+ * @param {Object} bounds - {startX, startY, endX, endY} plot rectangle
+ * @param {Object} easing - current {x1, y1, x2, y2}
+ * @returns {Object|null} {x1, y1} for "prev" or {x2, y2} for "next"; null if unmappable
+ */
+export function tangentMatchedHandle(side, points, bounds, easing) {
+    if (!points || !bounds || !easing) return null;
+
+    var width = bounds.endX - bounds.startX;
+    var height = bounds.startY - bounds.endY;
+    if (!(width > 0) || !(height > 0)) return null;
+
+    var cornerX, cornerY, dirX, dirY, handleX, handleY, sign;
+    if (side === "prev") {
+        // The neighbour's direction of travel as it arrives at the shared keyframe.
+        cornerX = bounds.startX;
+        cornerY = bounds.endY;
+        dirX = points.p3[0] - points.cp2[0];
+        dirY = points.p3[1] - points.cp2[1];
+        handleX = easing.x1 * width;
+        handleY = easing.y1 * height;
+        sign = 1;
+    } else {
+        // The direction it sets off in, leaving the shared keyframe.
+        cornerX = bounds.endX;
+        cornerY = bounds.startY;
+        dirX = points.cp1[0] - points.p0[0];
+        dirY = points.cp1[1] - points.p0[1];
+        handleX = (1 - easing.x2) * width;
+        handleY = (1 - easing.y2) * height;
+        sign = -1;
+    }
+
+    var dirLength = Math.sqrt(dirX * dirX + dirY * dirY);
+    if (!(dirLength > 0)) return null;
+    dirX /= dirLength;
+    dirY /= dirLength;
+
+    var length = Math.sqrt(handleX * handleX + handleY * handleY);
+    // A handle already flattened onto the keyframe has no length worth keeping. A third of
+    // the segment is Cavalry's own default influence, so it is the least surprising stand-in.
+    if (!(length > 0)) length = width / 3;
+
+    // Time must keep running forwards: x1 and x2 have to stay within the plot or the curve
+    // folds back on itself. Shorten the handle rather than bend it — the angle is the point.
+    if (dirX > 0) length = Math.min(length, width / dirX);
+
+    var px = cornerX + sign * dirX * length;
+    var py = cornerY + sign * dirY * length;
+
+    if (side === "prev") {
+        return { x1: (px - bounds.startX) / width, y1: (py - bounds.endY) / height };
+    }
+    return { x2: (px - bounds.startX) / width, y2: (py - bounds.endY) / height };
+}
+
+/**
+ * A neighbouring segment's velocity curve, as points on the speed graph.
+ *
+ * Shared by the renderer and the hit-test so a click lands on the line that was drawn rather
+ * than on a second, subtly different reconstruction of it.
+ *
+ * The speed graph normalises each segment against its own peak, so a neighbour only says
+ * something about relative speed once it is measured against the SELECTED segment's peak in
+ * real units per frame — hence selPeak. A neighbour genuinely faster than the selection
+ * therefore runs off the top and gets clipped, which is the honest reading.
+ *
+ * @param {string} side - "prev" or "next"
+ * @param {Object} sel - selected segment {frameDiff, valueDiff}
+ * @param {Object} seg - neighbour {frameDiff, valueDiff, easing}
+ * @param {Object} bounds - {startX, startY, endX, endY} plot rectangle
+ * @param {number} selPeak - selected segment's peak speed, in value per frame
+ * @param {number} sampleCount
+ * @returns {{points: Array<Array<number>>, joinHeight: number}|null} joinHeight is the
+ *          neighbour's height at the corner it shares with the selection, as a fraction of
+ *          the plot height — what the selected curve's endpoint must equal to meet it.
+ */
+export function speedGhostPolyline(side, sel, seg, bounds, selPeak, sampleCount) {
+    if (!sel || !seg || !seg.easing) return null;
+    if (!(selPeak > 0) || !(sel.frameDiff > 0) || !(seg.frameDiff > 0)) return null;
+
+    var count = Math.max(2, sampleCount || 24);
+    var pxPerFrame = (bounds.endX - bounds.startX) / sel.frameDiff;
+    var graphHeight = bounds.startY - bounds.endY;
+    var spanX = seg.frameDiff * pxPerFrame;
+    var originX = side === "prev" ? bounds.startX - spanX : bounds.endX;
+
+    var sampled = sampleVelocityCurveWithMax(
+        Math.min(0.999, Math.max(0.001, seg.easing.x1)),
+        seg.easing.y1,
+        Math.min(0.999, Math.max(0.001, seg.easing.x2)),
+        seg.easing.y2,
+        count
+    );
+    // sampled.samples are divided by this segment's own peak, so multiplying back by it and
+    // by the segment's real value-per-frame recovers absolute speed.
+    var segScale = sampled.max * Math.abs(seg.valueDiff / seg.frameDiff) / selPeak;
+
+    var points = [];
+    for (var s = 0; s <= count; s++) {
+        points.push([
+            originX + (s / count) * spanX,
+            bounds.endY + sampled.samples[s] * segScale * graphHeight
+        ]);
+    }
+
+    // The shared corner is the neighbour's END for prev, and its START for next.
+    var joinIndex = side === "prev" ? count : 0;
+    return { points: points, joinHeight: sampled.samples[joinIndex] * segScale };
+}

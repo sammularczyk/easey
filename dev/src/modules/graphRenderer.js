@@ -4,7 +4,8 @@
 import {
     cubicBezierToSpeed,
     sampleVelocityCurveWithMax,
-    neighbourCurveControlPoints
+    neighbourCurveControlPoints,
+    speedGhostPolyline
 } from './conversions.js';
 import { getTokens, blend } from './theme.js';
 
@@ -396,15 +397,21 @@ function drawGrid(canvas, bounds, tokens) {
 // clearly brighter than the grid. Fading rather than setting a literal grey keeps them
 // legible when the Cavalry theme changes, the same trick textMuted uses.
 var GHOST_FADE = 0.86;
-var GHOST_STROKE = 1;
+var GHOST_STROKE = 2;
+// Hovering is the only affordance available — ui.Draw exposes no cursor control — so the
+// highlight has to carry it alone: brighten toward the accent and thicken a little.
+var GHOST_HOVER_STROKE = 3;
+var GHOST_HOVER_FADE = 0.25;
 // Enough to keep the visible stub smooth; only the part inside the gutter is ever seen.
 var GHOST_SAMPLES = 24;
 
-function ghostPaint(tokens) {
+function ghostPaint(tokens, hovered) {
     return {
-        "color": blend(tokens.curve, tokens.plotBg, GHOST_FADE),
+        "color": hovered
+            ? blend(tokens.accent, tokens.plotBg, GHOST_HOVER_FADE)
+            : blend(tokens.curve, tokens.plotBg, GHOST_FADE),
         "stroke": true,
-        "strokeWidth": GHOST_STROKE
+        "strokeWidth": hovered ? GHOST_HOVER_STROKE : GHOST_STROKE
     };
 }
 
@@ -420,26 +427,22 @@ function ghostPaint(tokens) {
  * @param {Object} bounds - {startX, startY, endX, endY} plot rectangle
  * @param {Object} tokens - Theme tokens
  */
-function drawValueGhosts(canvas, neighbours, bounds, tokens) {
-    var path = new cavalry.Path();
-    var drew = false;
-
+function drawValueGhosts(canvas, neighbours, bounds, tokens, hoveredGhost) {
     var sides = [["prev", neighbours.prev], ["next", neighbours.next]];
+
     for (var i = 0; i < sides.length; i++) {
         var points = neighbourCurveControlPoints(sides[i][0], neighbours.sel, sides[i][1], bounds);
         if (!points) continue;
 
+        // One path per side rather than one for both, so only the hovered curve lights up.
+        var path = new cavalry.Path();
         path.moveTo(points.p0[0], points.p0[1]);
         path.cubicTo(
             points.cp1[0], points.cp1[1],
             points.cp2[0], points.cp2[1],
             points.p3[0], points.p3[1]
         );
-        drew = true;
-    }
-
-    if (drew) {
-        canvas.addPath(path.toObject(), ghostPaint(tokens));
+        canvas.addPath(path.toObject(), ghostPaint(tokens, hoveredGhost === sides[i][0]));
     }
 }
 
@@ -462,50 +465,23 @@ function drawValueGhosts(canvas, neighbours, bounds, tokens) {
  * @param {number} selPeak - the selected segment's peak speed, in value per frame
  * @param {Object} tokens - Theme tokens
  */
-function drawSpeedGhosts(canvas, neighbours, bounds, selPeak, tokens) {
-    if (!(selPeak > 0) || !(neighbours.sel.frameDiff > 0)) return;
-
-    var pxPerFrame = (bounds.endX - bounds.startX) / neighbours.sel.frameDiff;
-    var graphHeight = bounds.startY - bounds.endY;
-
-    var path = new cavalry.Path();
-    var drew = false;
-
+function drawSpeedGhosts(canvas, neighbours, bounds, selPeak, tokens, hoveredGhost) {
     var sides = [["prev", neighbours.prev], ["next", neighbours.next]];
+
     for (var i = 0; i < sides.length; i++) {
-        var seg = sides[i][1];
-        if (!seg || !(seg.frameDiff > 0)) continue;
+        var ghost = speedGhostPolyline(sides[i][0], neighbours.sel, sides[i][1], bounds, selPeak, GHOST_SAMPLES);
+        if (!ghost) continue;
 
-        var originX = sides[i][0] === "prev"
-            ? bounds.startX - seg.frameDiff * pxPerFrame
-            : bounds.endX;
-        var spanX = seg.frameDiff * pxPerFrame;
-
-        var sampled = sampleVelocityCurveWithMax(
-            Math.min(0.999, Math.max(0.001, seg.easing.x1)),
-            seg.easing.y1,
-            Math.min(0.999, Math.max(0.001, seg.easing.x2)),
-            seg.easing.y2,
-            GHOST_SAMPLES
-        );
-        // sampled.samples are divided by this segment's own peak, so multiplying back by it
-        // and by the segment's real value-per-frame recovers absolute speed.
-        var segScale = sampled.max * Math.abs(seg.valueDiff / seg.frameDiff) / selPeak;
-
-        for (var s = 0; s <= GHOST_SAMPLES; s++) {
-            var x = originX + (s / GHOST_SAMPLES) * spanX;
-            var y = bounds.endY + sampled.samples[s] * segScale * graphHeight;
+        // One path per side, so only the hovered curve lights up.
+        var path = new cavalry.Path();
+        for (var s = 0; s < ghost.points.length; s++) {
             if (s === 0) {
-                path.moveTo(x, y);
+                path.moveTo(ghost.points[s][0], ghost.points[s][1]);
             } else {
-                path.lineTo(x, y);
+                path.lineTo(ghost.points[s][0], ghost.points[s][1]);
             }
         }
-        drew = true;
-    }
-
-    if (drew) {
-        canvas.addPath(path.toObject(), ghostPaint(tokens));
+        canvas.addPath(path.toObject(), ghostPaint(tokens, hoveredGhost === sides[i][0]));
     }
 }
 
@@ -538,7 +514,7 @@ export function drawCurve(canvas, currentEasing, config) {
 
     // Before the curve, so the curve, handles and banner all paint over the ghosts.
     if (config.neighbours) {
-        drawValueGhosts(canvas, config.neighbours, bounds, tokens);
+        drawValueGhosts(canvas, config.neighbours, bounds, tokens, config.hoveredGhost);
     }
 
     // Create bezier curve path
@@ -660,7 +636,7 @@ export function drawSpeedCurve(canvas, currentEasing, speedEasing, config) {
     if (config.neighbours && config.neighbours.sel.frameDiff > 0) {
         var selPeak = sampledSelection.max *
             Math.abs(config.neighbours.sel.valueDiff / config.neighbours.sel.frameDiff);
-        drawSpeedGhosts(canvas, config.neighbours, bounds, selPeak, tokens);
+        drawSpeedGhosts(canvas, config.neighbours, bounds, selPeak, tokens, config.hoveredGhost);
     }
 
     // Draw velocity curve

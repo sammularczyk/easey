@@ -149,6 +149,9 @@ var speedDragHandle = null;
 
 // Hover state, drives the handle grow affordance on each graph
 var hoveredHandle = null;
+// Which ghost curve the pointer is over, 'prev' / 'next' / null. Clicking it rotates the
+// adjoining handle onto that neighbour's tangent.
+var hoveredGhost = null;
 var speedHoveredHandle = null;
 
 // Update banner hover: the row reveals the dismiss X, download highlights
@@ -252,6 +255,8 @@ var sharedState = {
     set speedDragHandle(v) { speedDragHandle = v; },
     get hoveredHandle() { return hoveredHandle; },
     set hoveredHandle(v) { hoveredHandle = v; },
+    get hoveredGhost() { return hoveredGhost; },
+    set hoveredGhost(v) { hoveredGhost = v; },
     get speedHoveredHandle() { return speedHoveredHandle; },
     set speedHoveredHandle(v) { speedHoveredHandle = v; },
     get bannerRowHover() { return bannerRowHover; },
@@ -294,6 +299,7 @@ function getGraphConfig() {
         padding: graphPadding,
         handleRadius: handleRadius,
         hoveredHandle: hoveredHandle,
+        hoveredGhost: hoveredGhost,
         neighbours: neighbourSegments,
         updateAvailable: isUpdateBannerVisible(),
         bannerRowHover: bannerRowHover,
@@ -308,6 +314,7 @@ function getSpeedGraphConfig() {
         padding: speedGraphPadding,
         handleRadius: speedHandleRadius,
         hoveredHandle: speedHoveredHandle,
+        hoveredGhost: hoveredGhost,
         neighbours: neighbourSegments,
         updateAvailable: isUpdateBannerVisible(),
         bannerRowHover: bannerRowHover,

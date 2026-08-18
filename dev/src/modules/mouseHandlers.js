@@ -1,7 +1,14 @@
 // Mouse event handler module
 // Handles mouse interactions for both value and speed graph canvases
 
-import { speedToCubicBezier } from './conversions.js';
+import {
+    speedToCubicBezier,
+    cubicBezierToSpeed,
+    neighbourCurveControlPoints,
+    tangentMatchedHandle,
+    speedGhostPolyline,
+    sampleVelocityCurveWithMax
+} from './conversions.js';
 import { updateBannerHit, updateBannerRegions, updateBannerContains } from './graphRenderer.js';
 
 /**
@@ -126,6 +133,126 @@ function updateBannerHover(position, config, state) {
     return true;
 }
 
+
+// How near the pointer must come to a ghost curve to grab it. Matches the handles' own grab
+// radius (handleRadius * 2), because the ghosts are thin, often short, and have nothing else
+// out in the gutter to be confused with.
+var GHOST_GRAB_RADIUS = 12;
+// Distance is measured to the line BETWEEN samples, not to the samples themselves, so this
+// only has to be dense enough to follow the curvature — not dense enough to cover the grab
+// radius. Point sampling alone would leave dead gaps along any ghost wider than a few hundred
+// pixels.
+var GHOST_HIT_SAMPLES = 24;
+
+function plotBounds(config) {
+    return {
+        startX: config.padding,
+        startY: config.height - config.padding,
+        endX: config.width - config.padding,
+        endY: config.padding
+    };
+}
+
+function cubicPoint(p0, cp1, cp2, p3, t) {
+    var m = 1 - t;
+    var a = m * m * m, b = 3 * m * m * t, c = 3 * m * t * t, d = t * t * t;
+    return [
+        a * p0[0] + b * cp1[0] + c * cp2[0] + d * p3[0],
+        a * p0[1] + b * cp1[1] + c * cp2[1] + d * p3[1]
+    ];
+}
+
+/** Shortest distance from a point to the line segment ab. */
+function distanceToSegment(point, a, b) {
+    var vx = b[0] - a[0];
+    var vy = b[1] - a[1];
+    var wx = point.x - a[0];
+    var wy = point.y - a[1];
+    var lengthSq = vx * vx + vy * vy;
+    var t = lengthSq > 0 ? (wx * vx + wy * vy) / lengthSq : 0;
+    t = Math.max(0, Math.min(1, t));
+    var dx = point.x - (a[0] + t * vx);
+    var dy = point.y - (a[1] + t * vy);
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+/** True when the pointer is within the grab radius of a polyline. */
+function nearPolyline(position, points) {
+    for (var i = 1; i < points.length; i++) {
+        if (distanceToSegment(position, points[i - 1], points[i]) < GHOST_GRAB_RADIUS) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * The value-graph ghost under the pointer, if any.
+ * Flattened to a polyline first: the curves are short and already approximate, so a
+ * closed-form point-to-cubic distance would be far more machinery than a hover test earns.
+ * @returns {{side: string, points: Object}|null}
+ */
+function ghostAt(position, config) {
+    if (!config.neighbours) return null;
+
+    var bounds = plotBounds(config);
+    var sides = [['prev', config.neighbours.prev], ['next', config.neighbours.next]];
+
+    for (var i = 0; i < sides.length; i++) {
+        var points = neighbourCurveControlPoints(sides[i][0], config.neighbours.sel, sides[i][1], bounds);
+        if (!points) continue;
+
+        var flat = [];
+        for (var s = 0; s <= GHOST_HIT_SAMPLES; s++) {
+            flat.push(cubicPoint(points.p0, points.cp1, points.cp2, points.p3, s / GHOST_HIT_SAMPLES));
+        }
+        if (nearPolyline(position, flat)) {
+            return { side: sides[i][0], points: points };
+        }
+    }
+    return null;
+}
+
+/**
+ * The selected segment's peak speed in value per frame — the scale every speed ghost is
+ * measured against. Mirrors what drawSpeedCurve computes so hit-testing matches the drawing.
+ */
+function selectedSpeedPeak(config, state) {
+    var sel = config.neighbours && config.neighbours.sel;
+    if (!sel || !(sel.frameDiff > 0)) return 0;
+
+    var easing = state.currentEasing;
+    var sampled = sampleVelocityCurveWithMax(
+        Math.min(0.999, Math.max(0.001, easing.x1)),
+        easing.y1,
+        Math.min(0.999, Math.max(0.001, easing.x2)),
+        easing.y2,
+        50
+    );
+    return sampled.max * Math.abs(sel.valueDiff / sel.frameDiff);
+}
+
+/**
+ * The speed-graph ghost under the pointer, if any.
+ * @returns {{side: string, joinHeight: number}|null}
+ */
+function speedGhostAt(position, config, state) {
+    if (!config.neighbours) return null;
+
+    var bounds = plotBounds(config);
+    var selPeak = selectedSpeedPeak(config, state);
+    var sides = [['prev', config.neighbours.prev], ['next', config.neighbours.next]];
+
+    for (var i = 0; i < sides.length; i++) {
+        var ghost = speedGhostPolyline(sides[i][0], config.neighbours.sel, sides[i][1], bounds, selPeak, GHOST_HIT_SAMPLES);
+        if (!ghost) continue;
+        if (nearPolyline(position, ghost.points)) {
+            return { side: sides[i][0], joinHeight: ghost.joinHeight };
+        }
+    }
+    return null;
+}
+
 /**
  * Create mouse handlers for the value graph canvas
  * @param {Object} options - Handler options
@@ -147,14 +274,36 @@ export function setupValueGraphHandlers(options) {
     canvas.onMousePress = function(position, button) {
         var config = getConfig();
 
-        // Checked before the handles: the banner overlays the graph's bottom
-        // edge, where a handle could otherwise sit.
-        if (config.updateAvailable && handleBannerPress(position, config, options)) return;
+        // The prev ghost lands in the bottom-left gutter and runs down through the banner's
+        // dismiss box, so the banner cannot simply claim that corner. A ghost actually under
+        // the pointer wins; the X stays clickable everywhere the thin ghost line is not.
+        var ghostUnderPointer = ghostAt(position, config);
+
+        // Otherwise checked before the handles: the banner overlays the graph's bottom edge,
+        // where a handle could sit.
+        if (!ghostUnderPointer && config.updateAvailable && handleBannerPress(position, config, options)) return;
 
         var handles = valueHandlePositions(config, state);
         var hit = handleAt(position, handles, ['cp1', 'cp2'], config.handleRadius * 2);
 
-        if (!hit) return;
+        if (!hit) {
+            var ghost = ghostUnderPointer;
+            if (ghost) {
+                var matched = tangentMatchedHandle(
+                    ghost.side, ghost.points, plotBounds(config), state.currentEasing
+                );
+                if (matched) {
+                    for (var key in matched) {
+                        state.currentEasing[key] = matched[key];
+                    }
+                    if (onUpdate) onUpdate();
+                    // Same completion path as releasing a handle drag, so a click applies and
+                    // clears the preset selection exactly as dragging would.
+                    if (onDragEnd) onDragEnd();
+                }
+            }
+            return;
+        }
 
         state.isDragging = true;
         state.dragHandle = hit;
@@ -175,9 +324,15 @@ export function setupValueGraphHandlers(options) {
         if (!state.isDragging) {
             var bannerChanged = updateBannerHover(position, config, state);
             var hovered = handleAt(position, valueHandlePositions(config, state), ['cp1', 'cp2'], config.handleRadius * 2);
+            // Handles win: they overlap the gutter by up to 20px where they are clamped.
+            var ghostHover = hovered ? null : (ghostAt(position, config) || {}).side || null;
+            // A ghost under the pointer suppresses the banner's own hover, so the dismiss X
+            // does not flicker in as you trace the curve past it.
+            if (ghostHover) bannerChanged = false;
 
-            if (hovered !== state.hoveredHandle || bannerChanged) {
+            if (hovered !== state.hoveredHandle || ghostHover !== state.hoveredGhost || bannerChanged) {
                 state.hoveredHandle = hovered;
+                state.hoveredGhost = ghostHover;
                 if (onHoverChange) onHoverChange();
             }
             return;
@@ -294,12 +449,41 @@ export function setupSpeedGraphHandlers(options) {
     canvas.onMousePress = function(position, button) {
         var config = getConfig();
 
-        if (config.updateAvailable && handleBannerPress(position, config, options)) return;
+        // As on the value graph: a ghost under the pointer outranks the banner, which would
+        // otherwise swallow the bottom-left corner where the prev ghost arrives.
+        var speedGhostUnderPointer = speedGhostAt(position, config, state);
+
+        if (!speedGhostUnderPointer && config.updateAvailable && handleBannerPress(position, config, options)) return;
 
         var handles = speedHandlePositions(config, state);
         var hit = handleAt(position, handles, ['out', 'in'], config.handleRadius * 2);
 
-        if (!hit) return;
+        if (!hit) {
+            // On this graph the y axis is speed, so meeting a neighbour means matching its
+            // HEIGHT at the shared keyframe rather than an angle — the speed graph's own way
+            // of saying the same thing the value graph says by rotating a handle.
+            var ghost = speedGhostUnderPointer;
+            if (ghost) {
+                if (ghost.side === 'prev') {
+                    state.speedEasing.outSpeedY = ghost.joinHeight;
+                } else {
+                    state.speedEasing.inSpeedY = ghost.joinHeight;
+                }
+                var updated = speedToCubicBezier(
+                    state.speedEasing.outInfluence,
+                    state.speedEasing.inInfluence,
+                    state.speedEasing.outSpeedY,
+                    state.speedEasing.inSpeedY
+                );
+                state.currentEasing.x1 = updated.x1;
+                state.currentEasing.y1 = updated.y1;
+                state.currentEasing.x2 = updated.x2;
+                state.currentEasing.y2 = updated.y2;
+                if (onUpdate) onUpdate();
+                if (onDragEnd) onDragEnd();
+            }
+            return;
+        }
 
         state.speedDragging = true;
         state.speedDragHandle = hit;
@@ -312,9 +496,12 @@ export function setupSpeedGraphHandlers(options) {
         if (!state.speedDragging) {
             var bannerChanged = updateBannerHover(position, config, state);
             var hovered = handleAt(position, speedHandlePositions(config, state), ['out', 'in'], config.handleRadius * 2);
+            // Handles win: they can sit over the gutter where the ghosts run.
+            var ghostHover = hovered ? null : (speedGhostAt(position, config, state) || {}).side || null;
 
-            if (hovered !== state.speedHoveredHandle || bannerChanged) {
+            if (hovered !== state.speedHoveredHandle || ghostHover !== state.hoveredGhost || bannerChanged) {
                 state.speedHoveredHandle = hovered;
+                state.hoveredGhost = ghostHover;
                 if (onHoverChange) onHoverChange();
             }
             return;
