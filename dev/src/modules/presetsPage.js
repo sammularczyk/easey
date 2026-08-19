@@ -8,7 +8,7 @@ import { drawCurveThumbnail, drawPresetTile } from './graphRenderer.js';
 
 var ROW_HEIGHT = 35;
 var ROW_RADIUS = 5;
-var ROW_PADDING = 8;
+var ROW_PADDING = 3;
 var THUMBNAIL_SIZE = 20;
 var LABEL_SIZE = 14;
 var HEADER_SIZE = 11;
@@ -133,7 +133,7 @@ export function createPresetsPage(config) {
     // centres it, which reads as presets floating in mid-air.
     pageLayout.addStretch();
 
-    function buildPresetRow(library, libraryIndex, preset, presetIndex, tokens, selection) {
+    function buildPresetRow(libraryIndex, preset, presetIndex, tokens, selection) {
         var isSelected = selection.libraryIndex === libraryIndex &&
                          selection.presetIndex === presetIndex;
 
@@ -173,6 +173,8 @@ export function createPresetsPage(config) {
         row.setBackgroundColor(restingBackground);
         // Enter/leave only fire once the Container is opted into hover events.
         row.useHoverEvents(true);
+        // The name is elided when the panel is too narrow to fit it.
+        row.setToolTip(preset.name);
 
         // The menu only shows on hover, so at rest it is painted the row's own
         // colour rather than hidden.
@@ -230,8 +232,6 @@ export function createPresetsPage(config) {
         label.setFontSize(TILE_LABEL_SIZE);
         label.setTextColor(isSelected ? tokens.text : tokens.textMuted);
         label.setFixedWidth(tileSize);
-        // The full name stays reachable when the label had to be shortened.
-        label.setToolTip(preset.name);
         label.setTransparentForMouseEvents(true);
 
         var content = new ui.VLayout();
@@ -244,11 +244,17 @@ export function createPresetsPage(config) {
         tile.setFixedWidth(tileSize);
         tile.setLayout(content);
         tile.useHoverEvents(true);
+        // The full name stays reachable when the label had to be shortened. It
+        // lives on the tile, not the label: the label is transparent for mouse
+        // events, so a tooltip there would never fire.
+        tile.setToolTip(preset.name);
 
         function paint() {
             thumbnail.setBackgroundColor(isSelected
                 ? blend(tokens.surface, tokens.accent, 0.25)
-                : tokens.surface);
+                : hovered
+                    ? blend(tokens.surface, tokens.accent, 0.07)
+                    : tokens.surface);
             drawPresetTile(canvas, preset, tileSize, tokens);
         }
 
@@ -324,8 +330,19 @@ export function createPresetsPage(config) {
                 var empty = new ui.Label("No presets yet");
                 empty.setFontSize(HEADER_SIZE);
                 empty.setTextColor(tokens.textMuted);
-                empty.setContentsMargins(ROW_PADDING, 4, ROW_PADDING, 8);
-                listLayout.add(empty);
+                empty.setTransparentForMouseEvents(true);
+
+                // Hosted in a layout rather than added bare, for the same reason
+                // the tile grid is hosted in a fixed-height Container below: a
+                // bare widget in this VLayout absorbs the window's leftover
+                // height instead of leaving it to the trailing stretch, which
+                // spreads the libraries apart. An HLayout sizes to its contents,
+                // and carries the inset the way buildLibraryHeader does.
+                var emptyRow = new ui.HLayout();
+                emptyRow.setMargins(ROW_PADDING, 4, ROW_PADDING, 8);
+                emptyRow.add(empty);
+                emptyRow.addStretch();
+                listLayout.add(emptyRow);
                 continue;
             }
 
@@ -357,7 +374,7 @@ export function createPresetsPage(config) {
 
             for (var j = 0; j < library.presets.length; j++) {
                 if (j > 0) listLayout.add(buildSeparator(tokens));
-                listLayout.add(buildPresetRow(library, i, library.presets[j], j, tokens, selection));
+                listLayout.add(buildPresetRow(i, library.presets[j], j, tokens, selection));
             }
         }
 
@@ -370,11 +387,6 @@ export function createPresetsPage(config) {
         widget: pageLayout,
         refresh: refresh,
         /**
-         * Tell the page how much width it has. Rebuilds only when this changes
-         * the tile size, so ordinary resize events cost nothing.
-         * @param {number} width - Page width in px
-         */
-        /**
          * Bound the scrolling area's height.
          * @param {number} height - Height in px
          */
@@ -386,6 +398,11 @@ export function createPresetsPage(config) {
         setViewportHeight: function(height) {
             if (height > 0) scrollView.setFixedHeight(height);
         },
+        /**
+         * Tell the page how much width it has. Rebuilds only when this changes
+         * the tile size, so ordinary resize events cost nothing.
+         * @param {number} width - Page width in px
+         */
         setAvailableWidth: function(width) {
             if (width === availableWidth) return;
             availableWidth = width;

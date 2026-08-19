@@ -8,6 +8,7 @@ import {
     speedGhostPolyline
 } from './conversions.js';
 import { getTokens, blend } from './theme.js';
+import { plotBounds, clampHandleToPlot, flipY } from './geometry.js';
 
 var DEFAULT_HANDLE_RADIUS = 6;
 
@@ -179,29 +180,6 @@ var BANNER_CAP_HEIGHT = 8.5;
 // Padding around the two hit targets, so they are comfortable to click without
 // making the whole strip swallow clicks meant for the graph.
 var BANNER_HIT_PADDING = 4;
-
-/**
- * Mirror a path builder's Y axis. Traced SVG coordinates are y-down; ui.Draw
- * is y-up.
- */
-function flipY(path, height, scale) {
-    var s = scale || 1;
-
-    return {
-        moveTo: function(x, y) {
-            path.moveTo(x * s, (height - y) * s);
-        },
-        lineTo: function(x, y) {
-            path.lineTo(x * s, (height - y) * s);
-        },
-        cubicTo: function(x1, y1, x2, y2, x, y) {
-            path.cubicTo(x1 * s, (height - y1) * s, x2 * s, (height - y2) * s, x * s, (height - y) * s);
-        },
-        close: function() {
-            path.close();
-        }
-    };
-}
 
 /**
  * The banner's two hit targets, in the canvas's y-up coordinates.
@@ -504,12 +482,12 @@ export function drawCurve(canvas, currentEasing, config) {
     // Set background color
     canvas.setBackgroundColor(tokens.plotBg);
 
-    var startX = padding;
-    var startY = height - padding;
-    var endX = width - padding;
-    var endY = padding;
+    var bounds = plotBounds({ width: width, height: height, padding: padding });
+    var startX = bounds.startX;
+    var startY = bounds.startY;
+    var endX = bounds.endX;
+    var endY = bounds.endY;
 
-    var bounds = { startX: startX, startY: startY, endX: endX, endY: endY };
     drawGrid(canvas, bounds, tokens);
 
     // Before the curve, so the curve, handles and banner all paint over the ghosts.
@@ -533,10 +511,8 @@ export function drawCurve(canvas, currentEasing, config) {
     var cp2Y = endY + y2 * (startY - endY);
 
     // Clamp handle positions for drawing (so they stay visible)
-    var visibleCp1X = Math.max(startX - 20, Math.min(endX + 20, cp1X));
-    var visibleCp1Y = Math.max(endY - 20, Math.min(startY + 20, cp1Y));
-    var visibleCp2X = Math.max(startX - 20, Math.min(endX + 20, cp2X));
-    var visibleCp2Y = Math.max(endY - 20, Math.min(startY + 20, cp2Y));
+    var visibleCp1 = clampHandleToPlot(cp1X, cp1Y, bounds);
+    var visibleCp2 = clampHandleToPlot(cp2X, cp2Y, bounds);
 
     // Draw the bezier curve (from bottom-left to top-right)
     curvePath.moveTo(startX, endY);
@@ -551,9 +527,9 @@ export function drawCurve(canvas, currentEasing, config) {
     // handles so the handles and their shadows sit on top.
     var controlPath = new cavalry.Path();
     controlPath.moveTo(startX, endY);
-    controlPath.lineTo(visibleCp1X, visibleCp1Y);
+    controlPath.lineTo(visibleCp1.x, visibleCp1.y);
     controlPath.moveTo(endX, startY);
-    controlPath.lineTo(visibleCp2X, visibleCp2Y);
+    controlPath.lineTo(visibleCp2.x, visibleCp2.y);
 
     var controlPaint = {"color": tokens.accent, "stroke": true, "strokeWidth": 2};
     if (controlPath && controlPath.toObject) {
@@ -561,8 +537,8 @@ export function drawCurve(canvas, currentEasing, config) {
     }
 
     // Create control handles (use visible positions for drawing)
-    drawHandle(canvas, visibleCp1X, visibleCp1Y, hoverRadius('cp1', config.hoveredHandle, handleRadius), tokens);
-    drawHandle(canvas, visibleCp2X, visibleCp2Y, hoverRadius('cp2', config.hoveredHandle, handleRadius), tokens);
+    drawHandle(canvas, visibleCp1.x, visibleCp1.y, hoverRadius('cp1', config.hoveredHandle, handleRadius), tokens);
+    drawHandle(canvas, visibleCp2.x, visibleCp2.y, hoverRadius('cp2', config.hoveredHandle, handleRadius), tokens);
 
     if (config.updateAvailable) {
         drawUpdateBanner(canvas, width, tokens, config.bannerRowHover, config.bannerDownloadHover);
@@ -573,19 +549,81 @@ export function drawCurve(canvas, currentEasing, config) {
 }
 
 /**
+ * Pure derivation of everything the speed graph draws and hit-tests, computed from the current
+ * cubic-bezier easing alone. This used to be split across a mutation drawSpeedCurve made into its
+ * `speedEasing` argument (outInfluence/inInfluence/outSpeedY/inSpeedY) and a second copy of the
+ * same math in mouseHandlers' selectedSpeedPeak. Both now read from here instead, so the speed
+ * graph's hit-testing no longer depends on a draw having run first, and there is exactly one
+ * implementation of the derivation.
+ *
+ * Does not touch canvas/cavalry APIs and does not mutate either argument.
+ *
+ * @param {Object} currentEasing - Current easing values {x1, y1, x2, y2}
+ * @param {Object} config - Graph configuration {width, height, padding, neighbours?}
+ * @returns {Object} {outInfluence, inInfluence, outSpeedY, inSpeedY, outHandleX, outHandleY,
+ *   inHandleX, inHandleY, sampleCount, velocitySamples, peak}
+ */
+export function speedCurveGeometry(currentEasing, config) {
+    var speed = cubicBezierToSpeed(currentEasing.x1, currentEasing.y1, currentEasing.x2, currentEasing.y2);
+    var outInfluence = speed.outInfluence;
+    var inInfluence = speed.inInfluence;
+    var outSpeedY = speed.outSpeedY;
+    var inSpeedY = speed.inSpeedY;
+
+    var bounds = plotBounds(config);
+    var startX = bounds.startX;
+    var endX = bounds.endX;
+    var endY = bounds.endY;
+    var midX = bounds.midX;
+    var graphHeight = bounds.graphHeight;
+
+    var outHandleX = startX + (outInfluence / 100) * (midX - startX);
+    var inHandleX = endX - (inInfluence / 100) * (endX - midX);
+    var outHandleY = endY + (outSpeedY * graphHeight);
+    var inHandleY = endY + (inSpeedY * graphHeight);
+
+    // Clamp x values for velocity calculation
+    var x1Clamped = Math.min(0.999, Math.max(0.001, currentEasing.x1));
+    var x2Clamped = Math.min(0.999, Math.max(0.001, currentEasing.x2));
+
+    var sampleCount = 50;
+    var sampledSelection = sampleVelocityCurveWithMax(
+        x1Clamped, currentEasing.y1, x2Clamped, currentEasing.y2, sampleCount
+    );
+
+    // The neighbours are scaled against the selection's peak in real value-per-frame, which is
+    // what makes the three segments comparable on one axis.
+    var sel = config.neighbours && config.neighbours.sel;
+    var peak = (sel && sel.frameDiff > 0)
+        ? sampledSelection.max * Math.abs(sel.valueDiff / sel.frameDiff)
+        : 0;
+
+    return {
+        outInfluence: outInfluence,
+        inInfluence: inInfluence,
+        outSpeedY: outSpeedY,
+        inSpeedY: inSpeedY,
+        outHandleX: outHandleX,
+        outHandleY: outHandleY,
+        inHandleX: inHandleX,
+        inHandleY: inHandleY,
+        sampleCount: sampleCount,
+        velocitySamples: sampledSelection.samples,
+        peak: peak
+    };
+}
+
+/**
  * Draw the speed curve on the speed graph canvas (velocity-based)
  * @param {Object} canvas - The ui.Draw canvas element
  * @param {Object} currentEasing - Current easing values {x1, y1, x2, y2}
- * @param {Object} speedEasing - Speed easing state to update
+ * @param {Object} speedEasing - Unused by drawing itself; kept for call-site compatibility.
+ *   Ownership of syncing this state from currentEasing has moved to mouseHandlers, which needs
+ *   it as a running drag baseline — drawing no longer writes into it.
  * @param {Object} config - Graph configuration {width, height, padding, handleRadius}
  */
 export function drawSpeedCurve(canvas, currentEasing, speedEasing, config) {
-    // Always sync speedEasing from currentEasing before drawing
-    var speed = cubicBezierToSpeed(currentEasing.x1, currentEasing.y1, currentEasing.x2, currentEasing.y2);
-    speedEasing.outInfluence = speed.outInfluence;
-    speedEasing.inInfluence = speed.inInfluence;
-    speedEasing.outSpeedY = speed.outSpeedY;
-    speedEasing.inSpeedY = speed.inSpeedY;
+    var geometry = speedCurveGeometry(currentEasing, config);
 
     canvas.clearPaths();
 
@@ -598,45 +636,29 @@ export function drawSpeedCurve(canvas, currentEasing, speedEasing, config) {
     canvas.setBackgroundColor(tokens.plotBg);
 
     // Graph coordinates
-    var startX = padding;
-    var startY = height - padding;
-    var endX = width - padding;
-    var endY = padding;
-    var midX = startX + (endX - startX) / 2;
+    var bounds = plotBounds({ width: width, height: height, padding: padding });
+    var startX = bounds.startX;
+    var startY = bounds.startY;
+    var endX = bounds.endX;
+    var endY = bounds.endY;
+    var midX = bounds.midX;
 
-    var bounds = { startX: startX, startY: startY, endX: endX, endY: endY };
     drawGrid(canvas, bounds, tokens);
 
-    // Get current cubic-bezier values
-    var x1 = currentEasing.x1;
-    var y1 = currentEasing.y1;
-    var x2 = currentEasing.x2;
-    var y2 = currentEasing.y2;
+    var graphHeight = bounds.graphHeight;
 
-    // Clamp x values for velocity calculation
-    var x1Clamped = Math.min(0.999, Math.max(0.001, x1));
-    var x2Clamped = Math.min(0.999, Math.max(0.001, x2));
+    // Handle positions
+    var outHandleX = geometry.outHandleX;
+    var inHandleX = geometry.inHandleX;
+    var outHandleY = geometry.outHandleY;
+    var inHandleY = geometry.inHandleY;
 
-    var graphHeight = startY - endY;
+    var sampleCount = geometry.sampleCount;
+    var velocitySamples = geometry.velocitySamples;
 
-    // Calculate handle positions
-    var outHandleX = startX + (speedEasing.outInfluence / 100) * (midX - startX);
-    var inHandleX = endX - (speedEasing.inInfluence / 100) * (endX - midX);
-    var outHandleY = endY + (speedEasing.outSpeedY * graphHeight);
-    var inHandleY = endY + (speedEasing.inSpeedY * graphHeight);
-
-    // Sample velocity curve
-    var sampleCount = 50;
-    var sampledSelection = sampleVelocityCurveWithMax(x1Clamped, y1, x2Clamped, y2, sampleCount);
-    var velocitySamples = sampledSelection.samples;
-
-    // Ghosts before the curve, so the curve and handles paint over them. The neighbours are
-    // scaled against the selection's peak in real value-per-frame, which is what makes the
-    // three segments comparable on one axis.
-    if (config.neighbours && config.neighbours.sel.frameDiff > 0) {
-        var selPeak = sampledSelection.max *
-            Math.abs(config.neighbours.sel.valueDiff / config.neighbours.sel.frameDiff);
-        drawSpeedGhosts(canvas, config.neighbours, bounds, selPeak, tokens, config.hoveredGhost);
+    // Ghosts before the curve, so the curve and handles paint over them.
+    if (config.neighbours && config.neighbours.sel && config.neighbours.sel.frameDiff > 0) {
+        drawSpeedGhosts(canvas, config.neighbours, bounds, geometry.peak, tokens, config.hoveredGhost);
     }
 
     // Draw velocity curve
@@ -644,8 +666,8 @@ export function drawSpeedCurve(canvas, currentEasing, speedEasing, config) {
 
     var rawStartVal = velocitySamples[0];
     var rawEndVal = velocitySamples[sampleCount];
-    var targetStartVal = speedEasing.outSpeedY;
-    var targetEndVal = speedEasing.inSpeedY;
+    var targetStartVal = geometry.outSpeedY;
+    var targetEndVal = geometry.inSpeedY;
     var deltaStart = targetStartVal - rawStartVal;
     var deltaEnd = targetEndVal - rawEndVal;
 

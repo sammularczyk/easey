@@ -9,7 +9,7 @@
     "dev": "npm run build:assets && cross-env NODE_ENV=development npx bundler",
     "release": "npm run build:assets && cross-env NODE_ENV=production npx bundler && npm run publish:jsc",
     "publish:jsc": "node -e \"require('fs').copyFileSync('build/Easey.jsc','../Easey.jsc')\"",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {
     "@scenery/bundler": "^1.0.0",

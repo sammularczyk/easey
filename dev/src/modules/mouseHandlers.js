@@ -3,13 +3,12 @@
 
 import {
     speedToCubicBezier,
-    cubicBezierToSpeed,
     neighbourCurveControlPoints,
     tangentMatchedHandle,
-    speedGhostPolyline,
-    sampleVelocityCurveWithMax
+    speedGhostPolyline
 } from './conversions.js';
-import { updateBannerHit, updateBannerRegions, updateBannerContains } from './graphRenderer.js';
+import { updateBannerHit, updateBannerRegions, updateBannerContains, speedCurveGeometry } from './graphRenderer.js';
+import { plotBounds, clampHandleToPlot } from './geometry.js';
 
 /**
  * On-screen positions of the value graph's two control handles, clamped the
@@ -19,25 +18,16 @@ import { updateBannerHit, updateBannerRegions, updateBannerContains } from './gr
  * @returns {Object} {cp1: {x, y}, cp2: {x, y}}
  */
 function valueHandlePositions(config, state) {
-    var startX = config.padding;
-    var startY = config.height - config.padding;
-    var endX = config.width - config.padding;
-    var endY = config.padding;
+    var bounds = plotBounds(config);
 
-    var cp1X = startX + state.currentEasing.x1 * (endX - startX);
-    var cp1Y = endY + state.currentEasing.y1 * (startY - endY);
-    var cp2X = startX + state.currentEasing.x2 * (endX - startX);
-    var cp2Y = endY + state.currentEasing.y2 * (startY - endY);
+    var cp1X = bounds.startX + state.currentEasing.x1 * (bounds.endX - bounds.startX);
+    var cp1Y = bounds.endY + state.currentEasing.y1 * (bounds.startY - bounds.endY);
+    var cp2X = bounds.startX + state.currentEasing.x2 * (bounds.endX - bounds.startX);
+    var cp2Y = bounds.endY + state.currentEasing.y2 * (bounds.startY - bounds.endY);
 
     return {
-        cp1: {
-            x: Math.max(startX - 20, Math.min(endX + 20, cp1X)),
-            y: Math.max(endY - 20, Math.min(startY + 20, cp1Y))
-        },
-        cp2: {
-            x: Math.max(startX - 20, Math.min(endX + 20, cp2X)),
-            y: Math.max(endY - 20, Math.min(startY + 20, cp2Y))
-        }
+        cp1: clampHandleToPlot(cp1X, cp1Y, bounds),
+        cp2: clampHandleToPlot(cp2X, cp2Y, bounds)
     };
 }
 
@@ -48,22 +38,11 @@ function valueHandlePositions(config, state) {
  * @returns {Object} {out: {x, y}, in: {x, y}}
  */
 function speedHandlePositions(config, state) {
-    var startX = config.padding;
-    var startY = config.height - config.padding;
-    var endX = config.width - config.padding;
-    var endY = config.padding;
-    var midX = startX + (endX - startX) / 2;
-    var graphHeight = startY - endY;
+    var geometry = speedCurveGeometry(state.currentEasing, config);
 
     return {
-        out: {
-            x: startX + (state.speedEasing.outInfluence / 100) * (midX - startX),
-            y: endY + (state.speedEasing.outSpeedY * graphHeight)
-        },
-        in: {
-            x: endX - (state.speedEasing.inInfluence / 100) * (endX - midX),
-            y: endY + (state.speedEasing.inSpeedY * graphHeight)
-        }
+        out: { x: geometry.outHandleX, y: geometry.outHandleY },
+        in: { x: geometry.inHandleX, y: geometry.inHandleY }
     };
 }
 
@@ -144,15 +123,6 @@ var GHOST_GRAB_RADIUS = 12;
 // pixels.
 var GHOST_HIT_SAMPLES = 24;
 
-function plotBounds(config) {
-    return {
-        startX: config.padding,
-        startY: config.height - config.padding,
-        endX: config.width - config.padding,
-        endY: config.padding
-    };
-}
-
 function cubicPoint(p0, cp1, cp2, p3, t) {
     var m = 1 - t;
     var a = m * m * m, b = 3 * m * m * t, c = 3 * m * t * t, d = t * t * t;
@@ -215,21 +185,11 @@ function ghostAt(position, config) {
 
 /**
  * The selected segment's peak speed in value per frame — the scale every speed ghost is
- * measured against. Mirrors what drawSpeedCurve computes so hit-testing matches the drawing.
+ * measured against. Backed by the same geometry drawSpeedCurve draws from, so hit-testing
+ * matches the drawing without depending on a draw having run first.
  */
 function selectedSpeedPeak(config, state) {
-    var sel = config.neighbours && config.neighbours.sel;
-    if (!sel || !(sel.frameDiff > 0)) return 0;
-
-    var easing = state.currentEasing;
-    var sampled = sampleVelocityCurveWithMax(
-        Math.min(0.999, Math.max(0.001, easing.x1)),
-        easing.y1,
-        Math.min(0.999, Math.max(0.001, easing.x2)),
-        easing.y2,
-        50
-    );
-    return sampled.max * Math.abs(sel.valueDiff / sel.frameDiff);
+    return speedCurveGeometry(state.currentEasing, config).peak;
 }
 
 /**
@@ -324,7 +284,7 @@ export function setupValueGraphHandlers(options) {
         if (!state.isDragging) {
             var bannerChanged = updateBannerHover(position, config, state);
             var hovered = handleAt(position, valueHandlePositions(config, state), ['cp1', 'cp2'], config.handleRadius * 2);
-            // Handles win: they overlap the gutter by up to 20px where they are clamped.
+            // Handles win: they overlap the gutter by up to HANDLE_OVERFLOW px where they are clamped.
             var ghostHover = hovered ? null : (ghostAt(position, config) || {}).side || null;
             // A ghost under the pointer suppresses the banner's own hover, so the dismiss X
             // does not flicker in as you trace the curve past it.
@@ -338,11 +298,12 @@ export function setupValueGraphHandlers(options) {
             return;
         }
 
-        var startX = config.padding;
-        var startY = config.height - config.padding;
-        var endX = config.width - config.padding;
-        var endY = config.padding;
-        
+        var bounds = plotBounds(config);
+        var startX = bounds.startX;
+        var startY = bounds.startY;
+        var endX = bounds.endX;
+        var endY = bounds.endY;
+
         var x = position.x;
         var y = position.y;
         
@@ -464,16 +425,17 @@ export function setupSpeedGraphHandlers(options) {
             // of saying the same thing the value graph says by rotating a handle.
             var ghost = speedGhostUnderPointer;
             if (ghost) {
-                if (ghost.side === 'prev') {
-                    state.speedEasing.outSpeedY = ghost.joinHeight;
-                } else {
-                    state.speedEasing.inSpeedY = ghost.joinHeight;
-                }
+                // Derived fresh from currentEasing rather than read off state.speedEasing: this
+                // is a one-shot edit, not the start of a drag, so there is no running baseline to
+                // preserve and no reason to depend on it being in sync.
+                var geometry = speedCurveGeometry(state.currentEasing, config);
+                var outSpeedY = ghost.side === 'prev' ? ghost.joinHeight : geometry.outSpeedY;
+                var inSpeedY = ghost.side === 'prev' ? geometry.inSpeedY : ghost.joinHeight;
                 var updated = speedToCubicBezier(
-                    state.speedEasing.outInfluence,
-                    state.speedEasing.inInfluence,
-                    state.speedEasing.outSpeedY,
-                    state.speedEasing.inSpeedY
+                    geometry.outInfluence,
+                    geometry.inInfluence,
+                    outSpeedY,
+                    inSpeedY
                 );
                 state.currentEasing.x1 = updated.x1;
                 state.currentEasing.y1 = updated.y1;
@@ -484,6 +446,16 @@ export function setupSpeedGraphHandlers(options) {
             }
             return;
         }
+
+        // Seed the speed-space drag baseline from the current easing. onMouseMove below reads
+        // and mutates state.speedEasing directly for the rest of the drag (to avoid a
+        // cubic<->speed round trip on every move), so it must start in sync here rather than
+        // relying on drawSpeedCurve having run first.
+        var seed = speedCurveGeometry(state.currentEasing, config);
+        state.speedEasing.outInfluence = seed.outInfluence;
+        state.speedEasing.inInfluence = seed.inInfluence;
+        state.speedEasing.outSpeedY = seed.outSpeedY;
+        state.speedEasing.inSpeedY = seed.inSpeedY;
 
         state.speedDragging = true;
         state.speedDragHandle = hit;
@@ -507,13 +479,14 @@ export function setupSpeedGraphHandlers(options) {
             return;
         }
 
-        var startX = config.padding;
-        var startY = config.height - config.padding;
-        var endX = config.width - config.padding;
-        var endY = config.padding;
-        var midX = startX + (endX - startX) / 2;
-        var graphHeight = startY - endY;
-        
+        var bounds = plotBounds(config);
+        var startX = bounds.startX;
+        var startY = bounds.startY;
+        var endX = bounds.endX;
+        var endY = bounds.endY;
+        var midX = bounds.midX;
+        var graphHeight = bounds.graphHeight;
+
         var shiftPressed = api.isShiftHeld();
         var cmdPressed = api.isControlHeld();
         

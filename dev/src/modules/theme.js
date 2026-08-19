@@ -47,6 +47,9 @@ export function getTokens() {
         plotBg: windowBg,
         // Raised above the window, so it goes the other way.
         trough: blend(windowBg, "#ffffff", 0.06),
+        // rowSelected and grid both track the "Dark" swatch, so they resolve
+        // to the same value whenever the theme provides one; only their
+        // fallbacks differ, for the case where that key is unavailable.
         rowSelected: themeColor("Dark", FALLBACK.rowSelected),
         separator: themeColor("Midlight", FALLBACK.separator),
         grid: themeColor("Dark", FALLBACK.grid),
