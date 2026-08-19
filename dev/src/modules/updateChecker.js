@@ -7,7 +7,7 @@
  * @param {string} v2 - Second version string
  * @returns {number} 1 if v1 > v2, -1 if v1 < v2, 0 if equal
  */
-export function compareVersions(v1, v2) {
+function compareVersions(v1, v2) {
     var parts1 = v1.split('.').map(function(n) { return parseInt(n, 10) || 0; });
     var parts2 = v2.split('.').map(function(n) { return parseInt(n, 10) || 0; });
     

@@ -159,10 +159,23 @@ function getLibrary(model, libraryIndex) {
 }
 
 /**
+ * Look up a library and, if found, run `fn` with it as the return value of
+ * this call. If not found, short-circuits to `guardValue` without running
+ * `fn`. This folds the repeated "get the library, bail if it's missing"
+ * prologue used across the library/preset mutators below, while still
+ * letting each call site pick its own guard-failure return value.
+ */
+function withLibrary(model, libraryIndex, guardValue, fn) {
+    var library = getLibrary(model, libraryIndex);
+    if (!library) return guardValue;
+    return fn(library);
+}
+
+/**
  * @returns {boolean} Whether the model changed
  */
 export function createLibrary(model) {
-    var name = promptForName("New Library", "Enter library name (max 30 chars):", "My Library");
+    var name = promptForName("New Library", "Enter library name (max " + MAX_NAME_LENGTH + " chars):", "My Library");
     if (!name) return false;
 
     model.libraries.push({ name: name, presets: [] });
@@ -170,52 +183,49 @@ export function createLibrary(model) {
 }
 
 export function renameLibrary(model, libraryIndex) {
-    var library = getLibrary(model, libraryIndex);
-    if (!library) return false;
+    return withLibrary(model, libraryIndex, false, function(library) {
+        var name = promptForName("Rename Library", "Enter new name (max " + MAX_NAME_LENGTH + " chars):", library.name);
+        if (!name || name === library.name) return false;
 
-    var name = promptForName("Rename Library", "Enter new name (max 30 chars):", library.name);
-    if (!name || name === library.name) return false;
-
-    library.name = name;
-    return true;
+        library.name = name;
+        return true;
+    });
 }
 
 export function deleteLibrary(model, libraryIndex) {
-    var library = getLibrary(model, libraryIndex);
-    if (!library) return false;
+    return withLibrary(model, libraryIndex, false, function(library) {
+        // Deleting the last library would leave nowhere to save a preset.
+        if (model.libraries.length === 1) {
+            console.log("Cannot delete the only library.");
+            return false;
+        }
 
-    // Deleting the last library would leave nowhere to save a preset.
-    if (model.libraries.length === 1) {
-        console.log("Cannot delete the only library.");
-        return false;
-    }
+        var modal = new ui.Modal();
+        var confirmText = "Delete \"" + library.name + "\" and its " + library.presets.length +
+            " preset(s)?\n\nThis action cannot be undone.";
 
-    var modal = new ui.Modal();
-    var confirmText = "Delete \"" + library.name + "\" and its " + library.presets.length +
-        " preset(s)?\n\nThis action cannot be undone.";
+        if (!modal.showConfirmation("Delete Library", confirmText)) return false;
 
-    if (!modal.showConfirmation("Delete Library", confirmText)) return false;
-
-    model.libraries.splice(libraryIndex, 1);
-    return true;
+        model.libraries.splice(libraryIndex, 1);
+        return true;
+    });
 }
 
 /**
  * Write a library to a JSON file of the user's choosing.
  */
 export function exportLibrary(model, libraryIndex) {
-    var library = getLibrary(model, libraryIndex);
-    if (!library) return;
+    return withLibrary(model, libraryIndex, undefined, function(library) {
+        try {
+            var path = ui.chooseFileToSave(library.name + ".json", "Easey Library (*.json)");
+            if (!path) return;
 
-    try {
-        var path = ui.chooseFileToSave(library.name + ".json", "Easey Library (*.json)");
-        if (!path) return;
-
-        api.writeToFile(path, JSON.stringify(library, null, 2), true);
-        console.log("Exported \"" + library.name + "\" to " + path);
-    } catch (e) {
-        console.log("Error exporting library:", e.message);
-    }
+            api.writeToFile(path, JSON.stringify(library, null, 2), true);
+            console.log("Exported \"" + library.name + "\" to " + path);
+        } catch (e) {
+            console.log("Error exporting library:", e.message);
+        }
+    });
 }
 
 /**
@@ -248,33 +258,33 @@ export function importLibrary(model) {
 }
 
 export function savePresetToLibrary(model, libraryIndex, currentEasing) {
-    var library = getLibrary(model, libraryIndex);
-    if (!library) return false;
+    return withLibrary(model, libraryIndex, false, function(library) {
+        var name = promptForName("Save Preset", "Enter preset name (max " + MAX_NAME_LENGTH + " chars):", "My Preset");
+        if (!name) return false;
 
-    var name = promptForName("Save Preset", "Enter preset name (max 30 chars):", "My Preset");
-    if (!name) return false;
+        library.presets.push({
+            name: name,
+            x1: currentEasing.x1,
+            y1: currentEasing.y1,
+            x2: currentEasing.x2,
+            y2: currentEasing.y2
+        });
 
-    library.presets.push({
-        name: name,
-        x1: currentEasing.x1,
-        y1: currentEasing.y1,
-        x2: currentEasing.x2,
-        y2: currentEasing.y2
+        return true;
     });
-
-    return true;
 }
 
 export function renameLibraryPreset(model, libraryIndex, presetIndex) {
-    var library = getLibrary(model, libraryIndex);
-    if (!library || !library.presets[presetIndex]) return false;
+    return withLibrary(model, libraryIndex, false, function(library) {
+        if (!library.presets[presetIndex]) return false;
 
-    var preset = library.presets[presetIndex];
-    var name = promptForName("Rename Preset", "Enter new name (max 30 chars):", preset.name);
-    if (!name || name === preset.name) return false;
+        var preset = library.presets[presetIndex];
+        var name = promptForName("Rename Preset", "Enter new name (max " + MAX_NAME_LENGTH + " chars):", preset.name);
+        if (!name || name === preset.name) return false;
 
-    preset.name = name;
-    return true;
+        preset.name = name;
+        return true;
+    });
 }
 
 /**
@@ -282,40 +292,94 @@ export function renameLibraryPreset(model, libraryIndex, presetIndex) {
  * @returns {boolean} Whether the model changed
  */
 export function movePresetToLibrary(model, libraryIndex, presetIndex, targetLibraryIndex) {
-    var source = getLibrary(model, libraryIndex);
-    var target = getLibrary(model, targetLibraryIndex);
+    return withLibrary(model, libraryIndex, false, function(source) {
+        var target = getLibrary(model, targetLibraryIndex);
 
-    if (!source || !target || source === target) return false;
-    if (!source.presets[presetIndex]) return false;
+        if (!target || source === target) return false;
+        if (!source.presets[presetIndex]) return false;
 
-    target.presets.push(source.presets.splice(presetIndex, 1)[0]);
-    return true;
+        target.presets.push(source.presets.splice(presetIndex, 1)[0]);
+        return true;
+    });
 }
 
 export function deleteLibraryPreset(model, libraryIndex, presetIndex) {
-    var library = getLibrary(model, libraryIndex);
-    if (!library || !library.presets[presetIndex]) return false;
+    return withLibrary(model, libraryIndex, false, function(library) {
+        if (!library.presets[presetIndex]) return false;
 
-    var modal = new ui.Modal();
-    var confirmText = "Delete the preset \"" + library.presets[presetIndex].name +
-        "\"?\n\nThis action cannot be undone.";
+        var modal = new ui.Modal();
+        var confirmText = "Delete the preset \"" + library.presets[presetIndex].name +
+            "\"?\n\nThis action cannot be undone.";
 
-    if (!modal.showConfirmation("Delete Preset", confirmText)) return false;
+        if (!modal.showConfirmation("Delete Preset", confirmText)) return false;
 
-    library.presets.splice(presetIndex, 1);
-    return true;
+        library.presets.splice(presetIndex, 1);
+        return true;
+    });
 }
+
+/**
+ * Whether a loaded preference value should be treated as present. Used as
+ * the default validator for settings whose stored value needs no further
+ * checking beyond "it was actually saved".
+ */
+function isDefined(value) {
+    return value !== null && value !== undefined;
+}
+
+/**
+ * Build a {load, save} pair for a single preferences-backed setting.
+ * Mirrors the save/load shape every setting below used to hand-roll: save
+ * swallows and logs write errors, load swallows and logs read errors and
+ * falls back to `defaultValue` whenever the key is missing or `validate`
+ * rejects the stored value.
+ * @param {string} key - Preference key
+ * @param {*} defaultValue - Value returned when nothing valid is stored
+ * @param {function(*): boolean} validate - Whether a loaded value is usable
+ * @param {string} label - Used in the "Could not save/load <label>:" logs
+ */
+function makeSetting(key, defaultValue, validate, label) {
+    return {
+        load: function() {
+            try {
+                if (api.hasPreferenceObject(key)) {
+                    var saved = api.getPreferenceObject(key);
+                    if (validate(saved)) {
+                        return saved;
+                    }
+                }
+            } catch (e) {
+                console.log("Could not load " + label + ":", e.message);
+            }
+            return defaultValue;
+        },
+        save: function(value) {
+            try {
+                api.setPreferenceObject(key, value);
+            } catch (e) {
+                console.log("Could not save " + label + ":", e.message);
+            }
+        }
+    };
+}
+
+var applyOnDragSetting = makeSetting("easey_applyOnDrag", false, isDefined, "apply on drag setting");
+var updateCheckSetting = makeSetting("easey_checkForUpdates", true, isDefined, "update check setting");
+var clampIdenticalSetting = makeSetting("easey_clampIdenticalValues", true, isDefined, "clamp identical setting");
+var presetLayoutSetting = makeSetting("easey_presetLayout", "list", function(saved) {
+    return saved === "list" || saved === "grid";
+}, "preset layout setting");
+var dismissedUpdateSetting = makeSetting("easey_dismissedUpdate", null, function(saved) {
+    return typeof saved === "string";
+}, "dismissed update");
+var lastSelectedTabSetting = makeSetting("easey_lastSelectedTab", null, isDefined, "last selected tab");
 
 /**
  * Save apply on drag setting
  * @param {boolean} enabled - Whether apply on drag is enabled
  */
 export function saveApplyOnDragSetting(enabled) {
-    try {
-        api.setPreferenceObject("easey_applyOnDrag", enabled);
-    } catch (e) {
-        console.log("Could not save apply on drag setting:", e.message);
-    }
+    return applyOnDragSetting.save(enabled);
 }
 
 /**
@@ -323,17 +387,7 @@ export function saveApplyOnDragSetting(enabled) {
  * @returns {boolean} Whether apply on drag is enabled
  */
 export function loadApplyOnDragSetting() {
-    try {
-        if (api.hasPreferenceObject("easey_applyOnDrag")) {
-            var saved = api.getPreferenceObject("easey_applyOnDrag");
-            if (saved !== null && saved !== undefined) {
-                return saved;
-            }
-        }
-    } catch (e) {
-        console.log("Could not load apply on drag setting:", e.message);
-    }
-    return false;
+    return applyOnDragSetting.load();
 }
 
 /**
@@ -341,11 +395,7 @@ export function loadApplyOnDragSetting() {
  * @param {boolean} enabled - Whether the update check runs on launch
  */
 export function saveUpdateCheckSetting(enabled) {
-    try {
-        api.setPreferenceObject("easey_checkForUpdates", enabled);
-    } catch (e) {
-        console.log("Could not save update check setting:", e.message);
-    }
+    return updateCheckSetting.save(enabled);
 }
 
 /**
@@ -353,17 +403,7 @@ export function saveUpdateCheckSetting(enabled) {
  * @returns {boolean} Whether the update check runs on launch (default: true)
  */
 export function loadUpdateCheckSetting() {
-    try {
-        if (api.hasPreferenceObject("easey_checkForUpdates")) {
-            var saved = api.getPreferenceObject("easey_checkForUpdates");
-            if (saved !== null && saved !== undefined) {
-                return saved;
-            }
-        }
-    } catch (e) {
-        console.log("Could not load update check setting:", e.message);
-    }
-    return true;
+    return updateCheckSetting.load();
 }
 
 /**
@@ -371,11 +411,7 @@ export function loadUpdateCheckSetting() {
  * @param {boolean} enabled - Whether clamping is enabled
  */
 export function saveClampIdenticalSetting(enabled) {
-    try {
-        api.setPreferenceObject("easey_clampIdenticalValues", enabled);
-    } catch (e) {
-        console.log("Could not save clamp identical setting:", e.message);
-    }
+    return clampIdenticalSetting.save(enabled);
 }
 
 /**
@@ -383,17 +419,7 @@ export function saveClampIdenticalSetting(enabled) {
  * @returns {boolean} Whether clamping is enabled (default: true)
  */
 export function loadClampIdenticalSetting() {
-    try {
-        if (api.hasPreferenceObject("easey_clampIdenticalValues")) {
-            var saved = api.getPreferenceObject("easey_clampIdenticalValues");
-            if (saved !== null && saved !== undefined) {
-                return saved;
-            }
-        }
-    } catch (e) {
-        console.log("Could not load clamp identical setting:", e.message);
-    }
-    return true;
+    return clampIdenticalSetting.load();
 }
 
 /**
@@ -401,11 +427,7 @@ export function loadClampIdenticalSetting() {
  * @param {string} layout - "list" or "grid"
  */
 export function savePresetLayoutSetting(layout) {
-    try {
-        api.setPreferenceObject("easey_presetLayout", layout);
-    } catch (e) {
-        console.log("Could not save preset layout setting:", e.message);
-    }
+    return presetLayoutSetting.save(layout);
 }
 
 /**
@@ -413,17 +435,7 @@ export function savePresetLayoutSetting(layout) {
  * @returns {string} "list" or "grid" (default: "list")
  */
 export function loadPresetLayoutSetting() {
-    try {
-        if (api.hasPreferenceObject("easey_presetLayout")) {
-            var saved = api.getPreferenceObject("easey_presetLayout");
-            if (saved === "list" || saved === "grid") {
-                return saved;
-            }
-        }
-    } catch (e) {
-        console.log("Could not load preset layout setting:", e.message);
-    }
-    return "list";
+    return presetLayoutSetting.load();
 }
 
 /**
@@ -432,26 +444,14 @@ export function loadPresetLayoutSetting() {
  * @param {string} version - The version that was dismissed
  */
 export function saveDismissedUpdate(version) {
-    try {
-        api.setPreferenceObject("easey_dismissedUpdate", version);
-    } catch (e) {
-        console.log("Could not save dismissed update:", e.message);
-    }
+    return dismissedUpdateSetting.save(version);
 }
 
 /**
  * @returns {string|null} The dismissed version, or null
  */
 export function loadDismissedUpdate() {
-    try {
-        if (api.hasPreferenceObject("easey_dismissedUpdate")) {
-            var saved = api.getPreferenceObject("easey_dismissedUpdate");
-            if (typeof saved === "string") return saved;
-        }
-    } catch (e) {
-        console.log("Could not load dismissed update:", e.message);
-    }
-    return null;
+    return dismissedUpdateSetting.load();
 }
 
 /**
@@ -459,11 +459,7 @@ export function loadDismissedUpdate() {
  * @param {number} tabIndex - Index of the selected tab
  */
 export function saveLastSelectedTab(tabIndex) {
-    try {
-        api.setPreferenceObject("easey_lastSelectedTab", tabIndex);
-    } catch (e) {
-        console.log("Could not save last selected tab:", e.message);
-    }
+    return lastSelectedTabSetting.save(tabIndex);
 }
 
 /**
@@ -471,17 +467,7 @@ export function saveLastSelectedTab(tabIndex) {
  * @returns {number|null} Tab index or null if not saved
  */
 export function loadLastSelectedTab() {
-    try {
-        if (api.hasPreferenceObject("easey_lastSelectedTab")) {
-            var saved = api.getPreferenceObject("easey_lastSelectedTab");
-            if (saved !== null && saved !== undefined) {
-                return saved;
-            }
-        }
-    } catch (e) {
-        console.log("Could not load last selected tab:", e.message);
-    }
-    return null;
+    return lastSelectedTabSetting.load();
 }
 
 /**

@@ -64,7 +64,7 @@ import { getCompositionFrameRate } from './modules/conversions.js';
 import { drawCurve, drawSpeedCurve } from './modules/graphRenderer.js';
 import { setupValueGraphHandlers, setupSpeedGraphHandlers } from './modules/mouseHandlers.js';
 import { getEasingFromKeyframes, applyEasingToKeyframes, fixHoldPaths, setClampHoldsEnabled, copyKeyframeDuration, copyKeyframeValues, copyAllKeyframeInfo, readNeighbourSegments } from './modules/keyframeOps.js';
-import { 
+import {
     loadLibraries, saveLibraries, createLibrary, renameLibrary, deleteLibrary,
     exportLibrary, importLibrary, savePresetToLibrary, renameLibraryPreset,
     deleteLibraryPreset, movePresetToLibrary,
@@ -97,12 +97,6 @@ var DOWNLOAD_URL = "https://github.com/sammularczyk/Easey/releases/latest/downlo
 // Set when a newer version exists, which overlays a banner on the graphs.
 var updateAvailable = false;
 var latestVersion = null;
-// Forces that banner on so its appearance can be checked without a release.
-var previewUpdateBanner = false;
-// Dismissing a previewed banner is remembered separately from a real one, so
-// dev dismissals never write to preferences and re-enabling preview shows it
-// again.
-var previewBannerDismissed = false;
 
 // ============================================================================
 // STATE
@@ -267,7 +261,6 @@ var sharedState = {
 
 // The banner is only drawn on the graphs, never on the presets page.
 function isUpdateBannerVisible() {
-    if (previewUpdateBanner) return !previewBannerDismissed;
     if (!updateAvailable) return false;
 
     // Dismissal is remembered per version, so a later release shows the banner
@@ -280,9 +273,7 @@ function openDownloadPage() {
 }
 
 function dismissUpdateBanner() {
-    if (previewUpdateBanner) {
-        previewBannerDismissed = true;
-    } else if (latestVersion) {
+    if (latestVersion) {
         saveDismissedUpdate(latestVersion);
     }
 
@@ -334,9 +325,9 @@ function updateTextInput() {
     var y1 = (currentEasing.y1 !== undefined) ? currentEasing.y1 : 0.1;
     var x2 = (currentEasing.x2 !== undefined) ? currentEasing.x2 : 0.25;
     var y2 = (currentEasing.y2 !== undefined) ? currentEasing.y2 : 1.0;
-    
+
     var text = [x1, y1, x2, y2].map(formatBezierValue).join(", ");
-    
+
     isUpdatingTextInput = true;
     bezierInput.setText(text);
     isUpdatingTextInput = false;
@@ -347,13 +338,13 @@ function updateFromTextInput() {
     try {
         var text = bezierInput.getText();
         var values = text.split(',').map(function(v) { return parseFloat(v.trim()); });
-        
+
         if (values.length === 4 && values.every(function(v) { return !isNaN(v); })) {
             currentEasing.x1 = values[0];
             currentEasing.y1 = values[1];
             currentEasing.x2 = values[2];
             currentEasing.y2 = values[3];
-            
+
             redrawGraphs();
         } else {
             console.log("Error: Invalid cubic bezier values");
@@ -646,28 +637,28 @@ function showPresetContextMenu() {
     });
 
     ui.addMenuItem(separatorItem);
-    
+
     ui.addMenuItem({
         name: "Copy Current Curve to Clipboard",
         onMouseRelease: function() {
             copyCubicBezierToClipboard(currentEasing);
         }
     });
-    
+
     ui.addMenuItem({
         name: "Copy Keyframe Duration in ms",
         onMouseRelease: function() {
             copyKeyframeDuration();
         }
     });
-    
+
     ui.addMenuItem({
         name: "Copy Keyframe Values",
         onMouseRelease: function() {
             copyKeyframeValues();
         }
     });
-    
+
     ui.addMenuItem({
         name: "Copy All Keyframe Info",
         onMouseRelease: function() {
@@ -676,7 +667,7 @@ function showPresetContextMenu() {
     });
 
     ui.addMenuItem(separatorItem);
-    
+
     ui.addMenuItem({ name: "Preset layout", enabled: false });
 
     ["list", "grid"].forEach(function(layout) {
@@ -731,21 +722,6 @@ function showPresetContextMenu() {
 
     ui.addMenuItem(separatorItem);
 
-    // Demo aid: forces the update banner on so it can be seen without waiting
-    // for a release to exist. Remove before shipping.
-    ui.addMenuItem({
-        name: "Preview update banner" + (previewUpdateBanner ? " ✓" : ""),
-        onMouseRelease: function() {
-            previewUpdateBanner = !previewUpdateBanner;
-            // Re-enabling always shows the banner again, however it was last
-            // dismissed.
-            previewBannerDismissed = false;
-            redrawGraphs();
-        }
-    });
-
-    ui.addMenuItem(separatorItem);
-
     ui.addMenuItem({
         // Build ID identifies which bundle is actually loaded. currentVersion
         // itself stays clean so the update check keeps comparing versions.
@@ -794,9 +770,9 @@ presetContextButton.onClick = function() {
 
 bezierInput.onValueChanged = function() {
     if (isUpdatingTextInput) return;
-    
+
     updateFromTextInput();
-    
+
     if (!isUpdatingFromPreset) {
         clearPresetSelection();
     }

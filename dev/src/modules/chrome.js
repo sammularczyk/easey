@@ -4,6 +4,7 @@
 // callbacks. Container has both, plus background colour and corner radius.
 
 import { getTokens, blend } from './theme.js';
+import { flipY } from './geometry.js';
 
 var TAB_HEIGHT = 25;
 var STRIP_RADIUS = 5;
@@ -22,30 +23,6 @@ var BUTTON_RADIUS = 2;
 // The action buttons are always filled with the accent, so their glyph is a
 // fixed dark rather than a theme colour that could match the accent.
 var GLYPH_COLOR = "#000000";
-
-/**
- * Path wrapper that flips the Y axis. ui.Draw is y-up (like Cavalry's scene)
- * but SVG is y-down, so tracing a Figma vector verbatim renders it mirrored.
- * Flipping here lets the builders below keep the exported SVG numbers as-is.
- * @param {Object} path - A cavalry.Path
- * @param {number} height - Height of the icon's viewBox
- */
-function flipY(path, height) {
-    return {
-        moveTo: function(x, y) {
-            path.moveTo(x, height - y);
-        },
-        lineTo: function(x, y) {
-            path.lineTo(x, height - y);
-        },
-        cubicTo: function(x1, y1, x2, y2, x, y) {
-            path.cubicTo(x1, height - y1, x2, height - y2, x, height - y);
-        },
-        close: function() {
-            path.close();
-        }
-    };
-}
 
 // Icon outlines traced from the design's vectors, kept at their native viewBox
 // coordinates. Each icon canvas is sized to the icon, so no offset maths is
@@ -244,7 +221,7 @@ export function buildBottomBar(input, leadingButton, trailingButton) {
  * Build the segmented tab strip.
  * @param {Array} tabs - [{label: string, icon: string}] where icon keys ICONS
  * @param {Function} onSelect - Called with the new index when a tab is clicked
- * @returns {Object} {widget, setSelected(index), selectedIndex()}
+ * @returns {Object} {widget, setSelected(index), setCompact(state), setTabVisible(index, visible)}
  */
 export function buildTabStrip(tabs, onSelect) {
     var tokens = getTokens();
@@ -350,9 +327,6 @@ export function buildTabStrip(tabs, onSelect) {
             if (index < 0 || index >= entries.length) return;
             selectedIndex = index;
             paintAll();
-        },
-        selectedIndex: function() {
-            return selectedIndex;
         },
         /**
          * Hide the labels and leave icons only, for windows too narrow to fit
