@@ -1,13 +1,12 @@
-# Easey
+<img width="640" height="320" alt="Easey" src="https://github.com/user-attachments/assets/61a05741-0a90-429f-90dc-9435a7fbf098" />
+
 ### Open source speed and value graph for Cavalry
 
 <p align="left" style="margin-top:0;margin-bottom:0;">
   <a href="https://github.com/sammularczyk/Easey/releases/latest/download/Easey.jsc">
-    <img width="186" height="58px" alt="quiver_download" src="https://github.com/user-attachments/assets/9295a646-c7ba-4649-b069-2e78204dc1ce" />
+    <img width="186" height="58px" alt="Download Easey" src="https://github.com/user-attachments/assets/cca733fc-1c4a-49c5-bf86-6dede6fd4787" />
   </a>
 </p>
-
-<img width="358" height="484" alt="Screenshot 2025-11-05 at 21 37 31" src="https://github.com/user-attachments/assets/0ef835e8-c318-4e14-a0e1-29826cfc97f2" />
 
 Adds a speed graph, simple value graph and allows cubic-bezier notation for easing between two keyframes. Makes easing easy. 
 
