@@ -38,7 +38,7 @@ function valueHandlePositions(config, state) {
  * @returns {Object} {out: {x, y}, in: {x, y}}
  */
 function speedHandlePositions(config, state) {
-    var geometry = speedCurveGeometry(state.currentEasing, config);
+    var geometry = speedCurveGeometry(state.currentEasing, config, state.speedEasing.dragScale);
 
     return {
         out: { x: geometry.outHandleX, y: geometry.outHandleY },
@@ -189,7 +189,7 @@ function ghostAt(position, config) {
  * matches the drawing without depending on a draw having run first.
  */
 function selectedSpeedPeak(config, state) {
-    return speedCurveGeometry(state.currentEasing, config).peak;
+    return speedCurveGeometry(state.currentEasing, config, state.speedEasing.dragScale).peak;
 }
 
 /**
@@ -431,11 +431,15 @@ export function setupSpeedGraphHandlers(options) {
                 var geometry = speedCurveGeometry(state.currentEasing, config);
                 var outSpeedY = ghost.side === 'prev' ? ghost.joinHeight : geometry.outSpeedY;
                 var inSpeedY = ghost.side === 'prev' ? geometry.inSpeedY : ghost.joinHeight;
+                // joinHeight is a height on this graph, so it converts back through the scale
+                // the graph is drawn at — which makes the match exact in value-per-frame, not
+                // just visually flush.
                 var updated = speedToCubicBezier(
                     geometry.outInfluence,
                     geometry.inInfluence,
                     outSpeedY,
-                    inSpeedY
+                    inSpeedY,
+                    geometry.scale
                 );
                 state.currentEasing.x1 = updated.x1;
                 state.currentEasing.y1 = updated.y1;
@@ -456,6 +460,10 @@ export function setupSpeedGraphHandlers(options) {
         state.speedEasing.inInfluence = seed.inInfluence;
         state.speedEasing.outSpeedY = seed.outSpeedY;
         state.speedEasing.inSpeedY = seed.inSpeedY;
+        // The y axis is normalised to the peak, and the peak moves as the curve changes. Freeze
+        // it for the drag: the whole graph is drawn and hit-tested against this one number
+        // until release, so the handle stays under the pointer instead of sliding away from it.
+        state.speedEasing.dragScale = seed.scale;
 
         state.speedDragging = true;
         state.speedDragHandle = hit;
@@ -519,7 +527,7 @@ export function setupSpeedGraphHandlers(options) {
         }
         
         // Sync speed to value
-        var cubic = speedToCubicBezier(state.speedEasing.outInfluence, state.speedEasing.inInfluence, state.speedEasing.outSpeedY, state.speedEasing.inSpeedY);
+        var cubic = speedToCubicBezier(state.speedEasing.outInfluence, state.speedEasing.inInfluence, state.speedEasing.outSpeedY, state.speedEasing.inSpeedY, state.speedEasing.dragScale);
         state.currentEasing.x1 = cubic.x1;
         state.currentEasing.y1 = cubic.y1;
         state.currentEasing.x2 = cubic.x2;
@@ -532,6 +540,8 @@ export function setupSpeedGraphHandlers(options) {
         if (state.speedDragging) {
             state.speedDragging = false;
             state.speedDragHandle = null;
+            // Back to the curve's own peak, so the graph refits the plot.
+            state.speedEasing.dragScale = 0;
             
             if (onDragEnd) onDragEnd();
         }

@@ -560,15 +560,16 @@ export function drawCurve(canvas, currentEasing, config) {
  *
  * @param {Object} currentEasing - Current easing values {x1, y1, x2, y2}
  * @param {Object} config - Graph configuration {width, height, padding, neighbours?}
+ * @param {number} [scaleOverride] - Normalise against this peak (in normalized bezier units)
+ *   instead of the curve's own. A drag freezes the scale it started with so the handle tracks
+ *   the pointer instead of chasing a ruler that moves as the curve changes.
  * @returns {Object} {outInfluence, inInfluence, outSpeedY, inSpeedY, outHandleX, outHandleY,
- *   inHandleX, inHandleY, sampleCount, velocitySamples, peak}
+ *   inHandleX, inHandleY, sampleCount, velocitySamples, sampleTimes, scale, peak}
  */
-export function speedCurveGeometry(currentEasing, config) {
+export function speedCurveGeometry(currentEasing, config, scaleOverride) {
     var speed = cubicBezierToSpeed(currentEasing.x1, currentEasing.y1, currentEasing.x2, currentEasing.y2);
     var outInfluence = speed.outInfluence;
     var inInfluence = speed.inInfluence;
-    var outSpeedY = speed.outSpeedY;
-    var inSpeedY = speed.inSpeedY;
 
     var bounds = plotBounds(config);
     var startX = bounds.startX;
@@ -576,11 +577,6 @@ export function speedCurveGeometry(currentEasing, config) {
     var endY = bounds.endY;
     var midX = bounds.midX;
     var graphHeight = bounds.graphHeight;
-
-    var outHandleX = startX + (outInfluence / 100) * (midX - startX);
-    var inHandleX = endX - (inInfluence / 100) * (endX - midX);
-    var outHandleY = endY + (outSpeedY * graphHeight);
-    var inHandleY = endY + (inSpeedY * graphHeight);
 
     // Clamp x values for velocity calculation
     var x1Clamped = Math.min(0.999, Math.max(0.001, currentEasing.x1));
@@ -591,11 +587,37 @@ export function speedCurveGeometry(currentEasing, config) {
         x1Clamped, currentEasing.y1, x2Clamped, currentEasing.y2, sampleCount
     );
 
+    // The graph always fits the plot: full height is the peak speed, whether that peak is the
+    // curve's own or the one a drag froze. The samples come back divided by the curve's own
+    // peak, so a frozen scale only needs them rescaled by the ratio.
+    var scale = (scaleOverride > 0) ? scaleOverride : sampledSelection.max;
+    var velocitySamples = sampledSelection.samples;
+    if (scale !== sampledSelection.max) {
+        var ratio = sampledSelection.max / scale;
+        velocitySamples = [];
+        for (var i = 0; i < sampledSelection.samples.length; i++) {
+            velocitySamples.push(sampledSelection.samples[i] * ratio);
+        }
+    }
+
+    // Handle heights are the curve's real speed at each keyframe, on the same scale as the
+    // curve — so the curve's ends land on the handles with no correction. Read off the CLAMPED
+    // x, matching what was sampled, or the two would disagree by a hair.
+    var clampedSpeed = cubicBezierToSpeed(x1Clamped, currentEasing.y1, x2Clamped, currentEasing.y2);
+    var outSpeedY = clampedSpeed.outSpeed / scale;
+    var inSpeedY = clampedSpeed.inSpeed / scale;
+
+    var outHandleX = startX + (outInfluence / 100) * (midX - startX);
+    var inHandleX = endX - (inInfluence / 100) * (endX - midX);
+    var outHandleY = endY + (outSpeedY * graphHeight);
+    var inHandleY = endY + (inSpeedY * graphHeight);
+
     // The neighbours are scaled against the selection's peak in real value-per-frame, which is
-    // what makes the three segments comparable on one axis.
+    // what makes the three segments comparable on one axis. Same scale the curve is drawn at,
+    // frozen scale included, or the ghosts would drift against it mid-drag.
     var sel = config.neighbours && config.neighbours.sel;
     var peak = (sel && sel.frameDiff > 0)
-        ? sampledSelection.max * Math.abs(sel.valueDiff / sel.frameDiff)
+        ? scale * Math.abs(sel.valueDiff / sel.frameDiff)
         : 0;
 
     return {
@@ -608,7 +630,9 @@ export function speedCurveGeometry(currentEasing, config) {
         inHandleX: inHandleX,
         inHandleY: inHandleY,
         sampleCount: sampleCount,
-        velocitySamples: sampledSelection.samples,
+        velocitySamples: velocitySamples,
+        sampleTimes: sampledSelection.times,
+        scale: scale,
         peak: peak
     };
 }
@@ -623,7 +647,8 @@ export function speedCurveGeometry(currentEasing, config) {
  * @param {Object} config - Graph configuration {width, height, padding, handleRadius}
  */
 export function drawSpeedCurve(canvas, currentEasing, speedEasing, config) {
-    var geometry = speedCurveGeometry(currentEasing, config);
+    // dragScale is set by the speed graph's drag handlers and cleared on release.
+    var geometry = speedCurveGeometry(currentEasing, config, speedEasing && speedEasing.dragScale);
 
     canvas.clearPaths();
 
@@ -655,6 +680,7 @@ export function drawSpeedCurve(canvas, currentEasing, speedEasing, config) {
 
     var sampleCount = geometry.sampleCount;
     var velocitySamples = geometry.velocitySamples;
+    var sampleTimes = geometry.sampleTimes;
 
     // Ghosts before the curve, so the curve and handles paint over them.
     if (config.neighbours && config.neighbours.sel && config.neighbours.sel.frameDiff > 0) {
@@ -664,22 +690,16 @@ export function drawSpeedCurve(canvas, currentEasing, speedEasing, config) {
     // Draw velocity curve
     var curvePath = new cavalry.Path();
 
-    var rawStartVal = velocitySamples[0];
-    var rawEndVal = velocitySamples[sampleCount];
-    var targetStartVal = geometry.outSpeedY;
-    var targetEndVal = geometry.inSpeedY;
-    var deltaStart = targetStartVal - rawStartVal;
-    var deltaEnd = targetEndVal - rawEndVal;
-
-    var firstY = endY + (targetStartVal * graphHeight);
-    curvePath.moveTo(startX, firstY);
+    // No correction between the samples and the handles: geometry derives both from the same
+    // speeds on the same scale, so the ends already sit on the handles. This used to shear the
+    // whole curve to force that, because the handles were placed at y1 rather than at the
+    // speed y1 implies (y1 / x1) — which lifted an Ease Out Back by over half the plot.
+    curvePath.moveTo(startX, endY + (velocitySamples[0] * graphHeight));
 
     for (var i = 1; i <= sampleCount; i++) {
-        var t = i / sampleCount;
-        var sampleX = startX + t * (endX - startX);
-        var shift = deltaStart + t * (deltaEnd - deltaStart);
-        var transformedVal = velocitySamples[i] + shift;
-        var sampleY = endY + (transformedVal * graphHeight);
+        // The sample's real time, not the bezier parameter it came from.
+        var sampleX = startX + sampleTimes[i] * (endX - startX);
+        var sampleY = endY + (velocitySamples[i] * graphHeight);
         curvePath.lineTo(sampleX, sampleY);
     }
 

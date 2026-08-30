@@ -34,6 +34,7 @@ export var GRAPH_CONFIG = {
 export var DEFAULT_SPEED_EASING = {
     outInfluence: 33,  // Default 33% X influence
     inInfluence: 33,   // Default 33% X influence
-    outSpeedY: 0,      // Left handle Y position (0 = baseline, 1 = top) -> maps to y1
-    inSpeedY: 0        // Right handle Y position (0 = baseline, 1 = top) -> maps to (1 - y2)
+    outSpeedY: 0,      // Left handle height (0 = baseline, 1 = the curve's peak speed)
+    inSpeedY: 0,       // Right handle height (0 = baseline, 1 = the curve's peak speed)
+    dragScale: 0       // Peak frozen for the duration of a drag; 0 = not dragging
 };

@@ -5,6 +5,7 @@
 
 import { getTokens, blend } from './theme.js';
 import { drawCurveThumbnail, drawPresetTile } from './graphRenderer.js';
+import { buildListGeometry, dropTargetAt, presetTop } from './presetLayout.js';
 
 var ROW_HEIGHT = 35;
 var ROW_RADIUS = 5;
@@ -14,6 +15,25 @@ var LABEL_SIZE = 14;
 var HEADER_SIZE = 11;
 var HEADER_TOP_MARGIN = 12;
 var MENU_WIDTH = 18;
+
+// Approximate rendered line height for an 11px label, since the UI font isn't
+// exposed to scripts and cavalry.measureText needs one. Used only to size the
+// fixed-height hosts below (~1.3x the font size, a typical single-line box).
+var LABEL_LINE_HEIGHT = 14;
+
+// A layout (HLayout/VLayout) cannot take a fixed height itself, so the header
+// is hosted in a Container the same way the tile grid already is below. The
+// value matches what the header currently renders as: its own top+bottom
+// margins around one line of HEADER_SIZE text.
+var HEADER_HEIGHT = HEADER_TOP_MARGIN + 4 + LABEL_LINE_HEIGHT; // 12 + 4 + 14 = 30
+
+// Same trick for the empty-library placeholder row: its own margins (4 top,
+// 8 bottom) around one line of HEADER_SIZE text.
+var PLACEHOLDER_HEIGHT = 4 + 8 + LABEL_LINE_HEIGHT; // 4 + 8 + 14 = 26
+
+// The smallest cursor movement (px, in the widget's own raw coordinates) that
+// turns a press into a drag rather than a click.
+var DRAG_THRESHOLD = 4;
 
 // Grid layout, traced from the design. TILE_MIN is the design's tile size and
 // the floor for how small tiles may get; they grow to divide the available
@@ -26,6 +46,18 @@ var TILE_GAP = 8;
 var TILE_LABEL_SIZE = 10;
 var TILE_LABEL_GAP = 6;
 var TILE_LABEL_LINES = 2;
+// Approximate rendered line height for a 10px label (see LABEL_LINE_HEIGHT).
+var TILE_LABEL_LINE_HEIGHT = 13;
+
+/**
+ * A tile's total height including its label, so it can be given a fixed
+ * height (needed for both layout and for the drag geometry to know it).
+ * @param {number} size - Tile edge length in px
+ * @returns {number}
+ */
+function computeTileBlockHeight(size) {
+    return size + TILE_LABEL_GAP + TILE_LABEL_LINES * TILE_LABEL_LINE_HEIGHT;
+}
 
 // Rough advance width per character as a fraction of font size. Only used to
 // decide where to truncate — cavalry.measureText needs a font family and style,
@@ -94,6 +126,8 @@ function buildMenuButton(onOpen, tokens) {
  * @param {Function} config.onApply - (preset) on double click
  * @param {Function} config.onLibraryMenu - (libraryIndex)
  * @param {Function} config.onPresetMenu - (libraryIndex, presetIndex)
+ * @param {Function} config.onReorder - (fromLibraryIndex, fromIndex, toLibraryIndex, toIndex)
+ *        called on drag-release with the slot dropTargetAt landed on
  * @returns {Object} {widget, refresh}
  */
 export function createPresetsPage(config) {
@@ -124,6 +158,143 @@ export function createPresetsPage(config) {
 
     var scrollView = new ui.ScrollView();
     scrollView.setLayout(listLayout);
+
+    // ---- Drag-to-reorder state ----
+    //
+    // A press grabs the mouse (measured: sibling onMouseEnter fires 0 times
+    // during a drag), so the only usable signal is onMouseMove on the widget
+    // that was pressed, and it keeps firing with positions well outside that
+    // widget's own bounds. There is also no insert/removeAt on VLayout, so
+    // widgets cannot be shuffled live during a drag — this only recomputes the
+    // drop target and paints feedback onto widgets that already exist. The
+    // actual move happens once, on release, via config.onReorder.
+    //
+    // geometryState is rebuilt every refresh() and is only ever read from a
+    // mouse handler on a currently-live widget, so it is never stale: nothing
+    // refreshes while a drag is in progress (refresh() destroys every widget,
+    // and touching a destroyed one is undefined behaviour).
+    var geometryState = null; // {geometry, spec}
+    var currentTokens = null;
+    var rowRefs = [];        // [libraryIndex][presetIndex] -> {widget, restingBg}
+    var tileRefs = [];       // [libraryIndex][presetIndex] -> widget
+    var separatorRefs = [];  // [libraryIndex][gapIndex] -> widget, gapIndex k sits between rows k and k+1
+    var currentFeedback = null; // {type:'separator'|'rowBg'|'tileBorder', widget, restore}
+
+    function clearDropFeedback() {
+        if (!currentFeedback) return;
+
+        if (currentFeedback.type === 'separator') {
+            currentFeedback.widget.setBackgroundColor(currentTokens.separator);
+        } else if (currentFeedback.type === 'rowBg') {
+            currentFeedback.widget.setBackgroundColor(currentFeedback.restore);
+        } else if (currentFeedback.type === 'tileBorder') {
+            currentFeedback.widget.setBorder();
+        }
+
+        currentFeedback = null;
+    }
+
+    /**
+     * Paint feedback for a drop target computed from dropTargetAt. List mode
+     * recolours the separator sitting in that gap; a gap at either end of a
+     * library has no separator (they only exist between rows), so the
+     * boundary row's own background is blended instead. Grid mode borders
+     * the tile currently occupying the slot.
+     */
+    function applyDropFeedback(target) {
+        clearDropFeedback();
+        if (!target) return;
+
+        if (geometryState.spec.isGrid) {
+            var tiles = tileRefs[target.libraryIndex];
+            if (!tiles || tiles.length === 0) return;
+
+            var tileIndex = Math.min(target.slot, tiles.length - 1);
+            var tile = tiles[tileIndex];
+            tile.setBorder(currentTokens.accent, 2);
+            currentFeedback = { type: 'tileBorder', widget: tile };
+            return;
+        }
+
+        var rows = rowRefs[target.libraryIndex];
+        if (!rows || rows.length === 0) return; // empty library: nothing to highlight
+
+        var count = rows.length;
+        if (target.slot > 0 && target.slot < count) {
+            var separator = separatorRefs[target.libraryIndex][target.slot - 1];
+            if (!separator) return;
+            separator.setBackgroundColor(currentTokens.accent);
+            currentFeedback = { type: 'separator', widget: separator };
+        } else {
+            var boundaryIndex = target.slot === 0 ? 0 : count - 1;
+            var boundaryRow = rows[boundaryIndex];
+            boundaryRow.widget.setBackgroundColor(blend(currentTokens.windowBg, currentTokens.accent, 0.25));
+            currentFeedback = { type: 'rowBg', widget: boundaryRow.widget, restore: boundaryRow.restingBg };
+        }
+    }
+
+    /**
+     * Wires press/move/release for one row or tile. `getWidgetHeight` and
+     * `getAbsolutePoint` differ between list rows and grid tiles, since list
+     * mode derives a row's top from presetTop while grid mode derives a
+     * tile's own left/top from its index and the column count.
+     */
+    function attachDragHandlers(widget, libraryIndex, presetIndex, getAbsolutePoint, onClick) {
+        var pressState = null;
+
+        return {
+            // Called for a left/other-button press only — right-click opens a
+            // menu instead and never starts a drag; callers branch on button
+            // before reaching this.
+            onPress: function(position) {
+                pressState = { x: position.x, y: position.y, dragging: false };
+            },
+            onMove: function(position) {
+                if (!pressState) return;
+
+                if (!pressState.dragging) {
+                    var movedX = Math.abs(position.x - pressState.x);
+                    var movedY = Math.abs(position.y - pressState.y);
+                    if (movedX <= DRAG_THRESHOLD && movedY <= DRAG_THRESHOLD) return;
+
+                    pressState.dragging = true;
+                    widget.setBorder(currentTokens.accent, 1);
+                }
+
+                var point = getAbsolutePoint(position);
+                if (!point) return;
+
+                var target = dropTargetAt(geometryState.geometry, point, geometryState.spec);
+                applyDropFeedback(target);
+            },
+            onRelease: function(position) {
+                if (!pressState) return;
+
+                var dragged = pressState.dragging;
+                // Cleared before either callback runs: both rebuild the list,
+                // which destroys this widget, and touching it after that is
+                // undefined behaviour.
+                pressState = null;
+
+                if (!dragged) {
+                    // A press that never moved is a click. Selecting here rather
+                    // than on press is what makes dragging possible at all:
+                    // onSelect refreshes both pages, and a refresh during a
+                    // press would delete the very widget still receiving the
+                    // move and release events.
+                    if (onClick) onClick();
+                    return;
+                }
+
+                widget.setBorder();
+                clearDropFeedback();
+
+                var point = getAbsolutePoint(position);
+                var target = point && dropTargetAt(geometryState.geometry, point, geometryState.spec);
+                if (target) config.onReorder(libraryIndex, presetIndex, target.libraryIndex, target.slot);
+            }
+        };
+    }
 
     var pageLayout = new ui.VLayout();
     pageLayout.setSpaceBetween(0);
@@ -180,13 +351,29 @@ export function createPresetsPage(config) {
         // colour rather than hidden.
         menu.setColor(restingBackground);
 
+        // List mode: this row's own top comes straight from presetTop, since
+        // rows share one fixed height and geometryState already knows it.
+        var drag = attachDragHandlers(row, libraryIndex, presetIndex, function(position) {
+            var top = presetTop(geometryState.geometry, libraryIndex, presetIndex, geometryState.spec);
+            if (top == null) return null;
+            return { x: position.x, y: top + (ROW_HEIGHT - position.y) };
+        }, function() {
+            config.onSelect(libraryIndex, presetIndex, preset);
+        });
+
         row.onMousePress = function(position, button) {
             if (button === "right") {
                 config.onPresetMenu(libraryIndex, presetIndex);
                 return;
             }
 
-            config.onSelect(libraryIndex, presetIndex, preset);
+            drag.onPress(position);
+        };
+        row.onMouseMove = function(position) {
+            drag.onMove(position);
+        };
+        row.onMouseRelease = function(position) {
+            drag.onRelease(position);
         };
         row.onMouseEnter = function() {
             row.setBackgroundColor(hoverBackground);
@@ -197,7 +384,7 @@ export function createPresetsPage(config) {
             menu.setColor(restingBackground);
         };
 
-        return row;
+        return { widget: row, restingBg: restingBackground };
     }
 
     /**
@@ -209,6 +396,11 @@ export function createPresetsPage(config) {
         var isSelected = selection.libraryIndex === libraryIndex &&
                          selection.presetIndex === presetIndex;
         var hovered = false;
+        // Captured once at build time rather than read from the outer
+        // `tileSize` in handlers below: it can only change between refreshes
+        // (never mid-drag), but pinning it here means this tile's own drag
+        // maths can never disagree with the size it was actually built at.
+        var tileBlockHeight = computeTileBlockHeight(tileSize);
 
         var canvas = new ui.Draw();
         canvas.setSize(tileSize, tileSize);
@@ -242,6 +434,9 @@ export function createPresetsPage(config) {
 
         var tile = new ui.Container();
         tile.setFixedWidth(tileSize);
+        // Needed so buildListGeometry's tileBlockHeight matches the tile the
+        // grid actually renders (see computeTileBlockHeight).
+        tile.setFixedHeight(tileBlockHeight);
         tile.setLayout(content);
         tile.useHoverEvents(true);
         // The full name stays reachable when the label had to be shortened. It
@@ -258,13 +453,47 @@ export function createPresetsPage(config) {
             drawPresetTile(canvas, preset, tileSize, tokens);
         }
 
+        // Grid mode: this tile's own left/top come from its index, the column
+        // count and the cell pitch — there is no presetTop equivalent here,
+        // since presetLayout returns null for grid (the caller derives tile
+        // origin itself, per its own doc comment).
+        var drag = attachDragHandlers(tile, libraryIndex, presetIndex, function(position) {
+            var spec = geometryState.spec;
+            var block = null;
+            for (var b = 0; b < geometryState.geometry.blocks.length; b++) {
+                if (geometryState.geometry.blocks[b].libraryIndex === libraryIndex) {
+                    block = geometryState.geometry.blocks[b];
+                }
+            }
+            if (!block) return null;
+
+            var columns = Math.max(1, spec.columns || 1);
+            var cellWidth = spec.metrics.tileSize + spec.metrics.tileGap;
+            var cellHeight = spec.metrics.tileBlockHeight + spec.metrics.tileGap;
+            var row = Math.floor(presetIndex / columns);
+            var column = presetIndex % columns;
+
+            var left = spec.metrics.gridLeft + column * cellWidth;
+            var top = block.contentTop + row * cellHeight;
+
+            return { x: left + position.x, y: top + (tileBlockHeight - position.y) };
+        }, function() {
+            config.onSelect(libraryIndex, presetIndex, preset);
+        });
+
         tile.onMousePress = function(position, button) {
             if (button === "right") {
                 config.onPresetMenu(libraryIndex, presetIndex);
                 return;
             }
 
-            config.onSelect(libraryIndex, presetIndex, preset);
+            drag.onPress(position);
+        };
+        tile.onMouseMove = function(position) {
+            drag.onMove(position);
+        };
+        tile.onMouseRelease = function(position) {
+            drag.onRelease(position);
         };
 
         tile.onMouseEnter = function() {
@@ -296,7 +525,14 @@ export function createPresetsPage(config) {
             config.onLibraryMenu(libraryIndex);
         }, tokens).widget);
 
-        return header;
+        // A layout cannot take a fixed height itself, so it is hosted in a
+        // Container — the same trick the tile grid uses below. Needed so
+        // HEADER_HEIGHT (the constant the drag geometry assumes) is what
+        // this actually renders as.
+        var host = new ui.Container();
+        host.setFixedHeight(HEADER_HEIGHT);
+        host.setLayout(header);
+        return host;
     }
 
     function buildSeparator(tokens) {
@@ -320,11 +556,23 @@ export function createPresetsPage(config) {
         var selection = config.getSelection();
         var isGrid = config.getLayout() === "grid";
 
+        currentTokens = tokens;
+        currentFeedback = null; // widgets it pointed at are about to be destroyed
+        rowRefs = [];
+        tileRefs = [];
+        separatorRefs = [];
+
+        var contentHeights = [];
+        var columns = 1;
+
         listLayout.clear();
 
         for (var i = 0; i < model.libraries.length; i++) {
             var library = model.libraries[i];
             listLayout.add(buildLibraryHeader(library, i, tokens));
+            rowRefs[i] = [];
+            tileRefs[i] = [];
+            separatorRefs[i] = [];
 
             if (library.presets.length === 0) {
                 var empty = new ui.Label("No presets yet");
@@ -342,7 +590,13 @@ export function createPresetsPage(config) {
                 emptyRow.setMargins(ROW_PADDING, 4, ROW_PADDING, 8);
                 emptyRow.add(empty);
                 emptyRow.addStretch();
-                listLayout.add(emptyRow);
+
+                // Same fixed-height-host trick as the header, so PLACEHOLDER_HEIGHT
+                // (what the drag geometry assumes this row occupies) is real.
+                var placeholderHost = new ui.Container();
+                placeholderHost.setFixedHeight(PLACEHOLDER_HEIGHT);
+                placeholderHost.setLayout(emptyRow);
+                listLayout.add(placeholderHost);
                 continue;
             }
 
@@ -354,7 +608,9 @@ export function createPresetsPage(config) {
                 grid.setMargins(ROW_PADDING, 0, ROW_PADDING, 8);
 
                 for (var g = 0; g < library.presets.length; g++) {
-                    grid.add(buildPresetTile(i, library.presets[g], g, tokens, selection));
+                    var tile = buildPresetTile(i, library.presets[g], g, tokens, selection);
+                    tileRefs[i][g] = tile;
+                    grid.add(tile);
                 }
 
                 // A FlowLayout has no height of its own, so a tall window hands
@@ -368,19 +624,50 @@ export function createPresetsPage(config) {
                 var gridHeight = grid.getHeightForWidth(gridWidth);
                 if (gridHeight > 0) gridHost.setFixedHeight(gridHeight);
 
+                contentHeights[i] = gridHeight;
+                // The column count FlowLayout will actually land on for this
+                // width and tile size — measured from the same gridWidth used
+                // above, not re-derived from computeTileSize's own (slightly
+                // different) width budget.
+                columns = Math.max(1, Math.floor((gridWidth + TILE_GAP) / (tileSize + TILE_GAP)));
+
                 listLayout.add(gridHost);
                 continue;
             }
 
             for (var j = 0; j < library.presets.length; j++) {
-                if (j > 0) listLayout.add(buildSeparator(tokens));
-                listLayout.add(buildPresetRow(i, library.presets[j], j, tokens, selection));
+                if (j > 0) {
+                    var separator = buildSeparator(tokens);
+                    separatorRefs[i][j - 1] = separator;
+                    listLayout.add(separator);
+                }
+                var built = buildPresetRow(i, library.presets[j], j, tokens, selection);
+                rowRefs[i][j] = built;
+                listLayout.add(built.widget);
             }
         }
 
         // Keeps libraries packed at the top instead of the layout sharing the
         // spare height out between them.
         listLayout.addStretch();
+
+        var spec = {
+            libraries: model.libraries,
+            isGrid: isGrid,
+            metrics: {
+                headerHeight: HEADER_HEIGHT,
+                placeholderHeight: PLACEHOLDER_HEIGHT,
+                rowHeight: ROW_HEIGHT,
+                separatorHeight: 1,
+                tileBlockHeight: computeTileBlockHeight(tileSize),
+                tileSize: tileSize,
+                tileGap: TILE_GAP,
+                gridLeft: ROW_PADDING
+            },
+            contentHeights: contentHeights,
+            columns: columns
+        };
+        geometryState = { geometry: buildListGeometry(spec), spec: spec };
     }
 
     return {

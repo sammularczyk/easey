@@ -67,7 +67,7 @@ import { getEasingFromKeyframes, applyEasingToKeyframes, fixHoldPaths, setClampH
 import {
     loadLibraries, saveLibraries, createLibrary, renameLibrary, deleteLibrary,
     exportLibrary, importLibrary, savePresetToLibrary, renameLibraryPreset,
-    deleteLibraryPreset, movePresetToLibrary,
+    deleteLibraryPreset, movePresetToLibrary, movePreset,
     saveApplyOnDragSetting, loadApplyOnDragSetting,
     saveClampIdenticalSetting, loadClampIdenticalSetting,
     saveUpdateCheckSetting, loadUpdateCheckSetting,
@@ -880,7 +880,19 @@ var presetsConfig = {
         return presetLayout;
     },
     onLibraryMenu: showLibraryMenu,
-    onPresetMenu: showPresetRowMenu
+    onPresetMenu: showPresetRowMenu,
+    // Drag-to-reorder. Fires from whichever page instance (tab or split-view
+    // panel) the drag started in — both share this config and this model, so
+    // the callback works regardless of which one called it.
+    onReorder: function(fromLibraryIndex, fromIndex, toLibraryIndex, toIndex) {
+        if (movePreset(presetModel, fromLibraryIndex, fromIndex, toLibraryIndex, toIndex)) {
+            // Indices shift under a move, so the old selection would point at
+            // the wrong preset — same reasoning as the "move to library" menu
+            // action above.
+            clearPresetSelection();
+            commitPresetChange();
+        }
+    }
 };
 
 var presetsPage = createPresetsPage(presetsConfig);
