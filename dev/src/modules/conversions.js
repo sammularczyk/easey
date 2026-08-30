@@ -146,37 +146,65 @@ export function velocityToCubicBezier(rightSpeed, rightInfluence, leftSpeed, lef
 }
 
 /**
- * Convert speed values to cubic-bezier
+ * Convert speed-graph handle positions back to a cubic-bezier.
+ *
+ * Inverse of cubicBezierToSpeed + the graph's normalisation. A handle at height h on a graph
+ * whose peak is `scale` means a real slope of h * scale, and a bezier's endpoint slope is
+ * y1 / x1 — so y1 = h * scale * x1. Passing the scale in rather than deriving it is what
+ * keeps a drag stable: the peak moves as you drag, and a handle measured against a moving
+ * ruler chases its own tail. Callers freeze it at drag start.
+ *
  * @param {number} outInfluence - Outgoing influence (0-100 percentage)
  * @param {number} inInfluence - Incoming influence (0-100 percentage)
- * @param {number} outSpeedY - Outgoing speed Y intensity (0-1 range)
- * @param {number} inSpeedY - Incoming speed Y intensity (0-1 range)
+ * @param {number} outSpeedY - Outgoing handle height, as a fraction of the plot (peak = 1)
+ * @param {number} inSpeedY - Incoming handle height, as a fraction of the plot
+ * @param {number} [scale] - The graph's peak speed in normalized bezier units; 1 if omitted
  * @returns {Object} Cubic bezier values {x1, y1, x2, y2}
  */
-export function speedToCubicBezier(outInfluence, inInfluence, outSpeedY, inSpeedY) {
+export function speedToCubicBezier(outInfluence, inInfluence, outSpeedY, inSpeedY, scale) {
+    var peak = (scale > 0) ? scale : 1;
+    var x1 = outInfluence / 100;
+    var x2 = 1 - (inInfluence / 100);
+
     return {
-        x1: outInfluence / 100,
-        y1: outSpeedY,                    // Left handle Y maps directly to y1
-        x2: 1 - (inInfluence / 100),
-        y2: 1 - inSpeedY                  // Right handle Y is inverted
+        x1: x1,
+        y1: outSpeedY * peak * x1,
+        x2: x2,
+        y2: 1 - inSpeedY * peak * (1 - x2)
     };
 }
 
 /**
- * Convert cubic-bezier to speed values
+ * Convert cubic-bezier to speed-graph terms.
+ *
+ * The speeds returned are real slopes — dValue/dTime in normalized bezier units, which is
+ * what the speed graph plots. A bezier's endpoint tangent is 3(P1 - P0), so the slope leaving
+ * the first keyframe is y1 / x1: the handle's RISE OVER RUN, not its rise. Reading y1 alone
+ * (as this used to) calls a long lazy ramp and a short steep one the same speed, which then
+ * has to be papered over when drawing.
+ *
  * @param {number} x1 - First control point X
  * @param {number} y1 - First control point Y
  * @param {number} x2 - Second control point X
  * @param {number} y2 - Second control point Y
- * @returns {Object} Speed values {outInfluence, inInfluence, outSpeedY, inSpeedY}
+ * @returns {Object} {outInfluence, inInfluence, outSpeed, inSpeed}
  */
 export function cubicBezierToSpeed(x1, y1, x2, y2) {
     return {
         outInfluence: x1 * 100,
         inInfluence: (1 - x2) * 100,
-        outSpeedY: y1,                    // y1 maps directly to left handle Y
-        inSpeedY: 1 - y2                  // y2 is inverted
+        outSpeed: (x1 > 0) ? y1 / x1 : 0,
+        inSpeed: (x2 < 1) ? (1 - y2) / (1 - x2) : 0
     };
+}
+
+/**
+ * Time fraction reached at parameter t on a normalized cubic bezier — cubic(t) with the
+ * endpoints pinned at 0 and 1. Monotone for x1, x2 in [0, 1], so it never folds back.
+ */
+export function bezierX(t, x1, x2) {
+    var m = 1 - t;
+    return 3 * m * m * t * x1 + 3 * m * t * t * x2 + t * t * t;
 }
 
 /**
@@ -232,6 +260,7 @@ export function sampleVelocityCurve(x1, y1, x2, y2, sampleCount) {
  */
 export function sampleVelocityCurveWithMax(x1, y1, x2, y2, sampleCount) {
     var samples = [];
+    var times = [];
     var maxSpeed = 0;
 
     // First pass: calculate all speeds and find maximum
@@ -239,6 +268,11 @@ export function sampleVelocityCurveWithMax(x1, y1, x2, y2, sampleCount) {
         var t = i / sampleCount;
         var speed = calculateVelocityAtTime(t, x1, y1, x2, y2);
         samples.push(speed);
+        // t is the bezier's PARAMETER, not its time. Plotting sample i at i/sampleCount
+        // stretches the speed graph horizontally wherever the easing is steep — the peak of
+        // an Ease Out Expo lands a fifth of the plot's width late. x(t) is the sample's real
+        // time, so it is what the x axis has to use.
+        times.push(bezierX(t, x1, x2));
         maxSpeed = Math.max(maxSpeed, speed);
     }
 
@@ -249,7 +283,7 @@ export function sampleVelocityCurveWithMax(x1, y1, x2, y2, sampleCount) {
         samples[j] = samples[j] / maxSpeed;
     }
 
-    return { samples: samples, max: maxSpeed };
+    return { samples: samples, times: times, max: maxSpeed };
 }
 
 /**
@@ -431,7 +465,8 @@ export function speedGhostPolyline(side, sel, seg, bounds, selPeak, sampleCount)
     var points = [];
     for (var s = 0; s <= count; s++) {
         points.push([
-            originX + (s / count) * spanX,
+            // Real time, not the bezier parameter — see the times comment in the sampler.
+            originX + sampled.times[s] * spanX,
             bounds.endY + sampled.samples[s] * segScale * graphHeight
         ]);
     }

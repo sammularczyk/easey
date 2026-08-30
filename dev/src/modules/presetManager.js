@@ -296,9 +296,43 @@ export function movePresetToLibrary(model, libraryIndex, presetIndex, targetLibr
         var target = getLibrary(model, targetLibraryIndex);
 
         if (!target || source === target) return false;
-        if (!source.presets[presetIndex]) return false;
 
-        target.presets.push(source.presets.splice(presetIndex, 1)[0]);
+        return movePreset(model, libraryIndex, presetIndex, targetLibraryIndex, target.presets.length);
+    });
+}
+
+/**
+ * Move a preset to an explicit slot, within its library or into another one.
+ * Backs drag-reordering, where the drop position is a slot rather than "the end".
+ *
+ * `toIndex` is the slot in the target's list *after* the preset has been taken
+ * out, so it ranges 0..length and is what a caller derived from cursor position
+ * naturally produces. Out-of-range values are clamped rather than rejected: a
+ * drag past the last row means "put it last", not "do nothing".
+ *
+ * @param {Object} model - Preset model, mutated in place
+ * @param {number} fromLibraryIndex - Library the preset is leaving
+ * @param {number} fromIndex - The preset's index in that library
+ * @param {number} toLibraryIndex - Library the preset is going to
+ * @param {number} toIndex - Destination slot, post-removal
+ * @returns {boolean} Whether anything actually changed
+ */
+export function movePreset(model, fromLibraryIndex, fromIndex, toLibraryIndex, toIndex) {
+    return withLibrary(model, fromLibraryIndex, false, function(source) {
+        var target = getLibrary(model, toLibraryIndex);
+
+        if (!target) return false;
+        if (!source.presets[fromIndex]) return false;
+
+        var slot = Math.max(0, Math.min(target.presets.length, toIndex));
+        // Same library and the same slot it came from: the splice pair would be
+        // a no-op, and reporting false spares the caller a save and a rebuild.
+        if (source === target && slot === fromIndex) return false;
+
+        var preset = source.presets.splice(fromIndex, 1)[0];
+        // Re-clamp: taking the preset out shortened a same-library target.
+        if (source === target) slot = Math.min(slot, target.presets.length);
+        target.presets.splice(slot, 0, preset);
         return true;
     });
 }

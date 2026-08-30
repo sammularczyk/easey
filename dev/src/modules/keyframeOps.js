@@ -69,6 +69,41 @@ function getSiblingKeyframeTimesSet(layerId, attrId) {
 }
 
 /**
+ * True on the builds whose motion-path velocity model is exact.
+ *
+ * On older builds, speed + influence did not map onto a cubic-bezier the way the direct
+ * conversion assumes — two position keys on a straight diagonal at the default speed 1 /
+ * influence 0.333 should render linear (0.333, 0.333, 0.667, 0.667) but best-fit 0.092, 0.009,
+ * 0.908, 0.991. Easey worked around that twice: straight segments were eased with bezier
+ * handles instead (exact, and in lockstep with single-channel attributes), and curved ones went
+ * through an iterative solver that measured what actually rendered.
+ *
+ * Newer builds fixed the model, which retires both workarounds and breaks the first one:
+ *   - the direct conversion renders the requested curve to rms 0.0000 on a straight segment,
+ *     and 0.0003 on a path whose arc is 1.48x its chord — so speed/influence is now spent as
+ *     distance along the path, and the solver has nothing left to correct;
+ *   - bezier handles are honoured ONLY while the keyframes carry no speed fields at all. Once
+ *     they do — at any speed, 1 included — the handles are stored but inert, so the tangent
+ *     route silently renders linear. That is the bug this gate fixes.
+ *
+ * The version string must be semver with a lowercase prerelease — not the spaced form
+ * getCavalryVersion reports — or versionLessThan logs an error and answers false, which is a
+ * silently wrong gate. Wrapped in try/catch because versionLessThan may not exist on old
+ * builds, and those are legacy by definition.
+ */
+var _exactVelocityModel = null;
+function usesExactVelocityModel() {
+    if (_exactVelocityModel === null) {
+        try {
+            _exactVelocityModel = !cavalry.versionLessThan('2.8.0-beta.2');
+        } catch (e) {
+            _exactVelocityModel = false;
+        }
+    }
+    return _exactVelocityModel;
+}
+
+/**
  * True when Cavalry evaluates this segment from speed + influence rather than from the
  * bezier handles. Handles are only honoured while both bounding speeds are 1; attributes
  * with no speed data at all (everything that isn't a motion path) are always handle-driven.
@@ -90,6 +125,12 @@ function segmentUsesVelocity(frameZeroData, frameEndData) {
     var inSpeed = frameEndData ? frameEndData.leftSpeed : null;
     if (outSpeed === undefined || outSpeed === null || inSpeed === undefined || inSpeed === null) {
         return false;
+    }
+    if (usesExactVelocityModel()) {
+        // The exact model renders from the speed fields whenever they exist, so their presence
+        // is the whole test — there is no speed at which the handles win. Measured: writing
+        // handles onto a segment whose speeds were both 1 changed the render by nothing at all.
+        return true;
     }
     return Math.abs(outSpeed - TANGENT_MODE_SPEED) > TANGENT_SPEED_EPSILON ||
         Math.abs(inSpeed - TANGENT_MODE_SPEED) > TANGENT_SPEED_EPSILON;
@@ -666,7 +707,10 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
         var isHold = _clampHoldsEnabled &&
             valuesAreIdentical(valuesX[j], valuesX[j + 1]) &&
             valuesAreIdentical(valuesY[j], valuesY[j + 1]);
-        var isStraight = !isHold && segmentPathIsStraight(
+        // The tangent route only exists for the legacy velocity model — see
+        // usesExactVelocityModel. Under the exact model these keyframes carry speed fields,
+        // which makes Cavalry ignore the handles entirely and render the segment linear.
+        var isStraight = !isHold && !usesExactVelocityModel() && segmentPathIsStraight(
             layerId, f0, f1,
             valuesX[j], valuesX[j + 1],
             valuesY[j], valuesY[j + 1]
@@ -690,6 +734,18 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
             velocityByFrame[f1].leftInfluence = DEFAULT_LEFT_INFLUENCE;
             flattenHandlesBetweenPair(layerId, 'position.x', f0, f1);
             flattenHandlesBetweenPair(layerId, 'position.y', f0, f1);
+        } else if (usesExactVelocityModel()) {
+            // Exact model: speed and influence map straight onto the requested curve, and
+            // Cavalry already spends it as distance along the path — so ask for it and stop.
+            // Measured: rms 0.0000 on a straight segment, 0.0003 on one whose arc is 1.48x its
+            // chord. Nothing left for the solver below to correct.
+            var direct = cubicBezierToVelocity(
+                currentEasing.x1, currentEasing.y1, currentEasing.x2, currentEasing.y2, f1 - f0
+            );
+            velocityByFrame[f0].rightSpeed = direct.rightSpeed;
+            velocityByFrame[f0].rightInfluence = direct.rightInfluence;
+            velocityByFrame[f1].leftSpeed = direct.leftSpeed;
+            velocityByFrame[f1].leftInfluence = direct.leftInfluence;
         } else {
             // Curved path: what the eye reads as easing is distance over time, and a curved
             // segment does not spread its distance evenly across its bezier parameter. Solve
@@ -731,24 +787,42 @@ function applyVelocityToMotionPathGroup(layerId, keyframeIds, frames, currentEas
         }
     }
     api.setFrame(savedFrame);   // straightness sampling scrubs the timeline
+    // Speed and influence are per SIDE, and a segment is governed by exactly two of them: the
+    // start key's right pair and the end key's left pair. The run's outermost sides — the first
+    // key's left pair and the last key's right pair — govern the segments EITHER SIDE of the
+    // selection, which the user did not pick.
+    //
+    // Under the exact model, writing those is destructive. Speed fields put their whole segment
+    // into velocity mode, and a fieldless side of such a segment then renders at the default
+    // speed rather than from its bezier handle. Measured: a neighbour eased with handles to
+    // 0.0076 / 0.0373 / 0.1152 rendered 0.1383 / 0.2958 / 0.4566 once all four fields were
+    // written to the shared key, and stayed exact when only the inner sides were.
+    //
+    // setKeyframeVelocity accepts a partial dictionary, so the outer sides are simply left out
+    // rather than seeded. Legacy builds keep writing all four: their handles are honoured at
+    // speed 1 regardless, and their behaviour is not ours to re-measure.
+    var writeOuterSides = !usesExactVelocityModel();
     for (var k = 0; k < n; k++) {
         var fr = frames[k];
         var vel = velocityByFrame[fr];
+        var sides = {};
+        if (writeOuterSides || k > 0) {
+            sides.leftSpeed = vel.leftSpeed;
+            sides.leftInfluence = vel.leftInfluence;
+        }
+        if (writeOuterSides || k < n - 1) {
+            sides.rightSpeed = vel.rightSpeed;
+            sides.rightInfluence = vel.rightInfluence;
+        }
         try {
             api.setKeyframeVelocity(layerId, {
                 'position.x': {
                     frame: fr,
-                    leftSpeed: vel.leftSpeed,
-                    rightSpeed: vel.rightSpeed,
-                    leftInfluence: vel.leftInfluence,
-                    rightInfluence: vel.rightInfluence
+                    ...sides
                 },
                 'position.y': {
                     frame: fr,
-                    leftSpeed: vel.leftSpeed,
-                    rightSpeed: vel.rightSpeed,
-                    leftInfluence: vel.leftInfluence,
-                    rightInfluence: vel.rightInfluence
+                    ...sides
                 }
             });
         } catch (e) {
@@ -916,9 +990,29 @@ function confirmMotionPathDesync(segments) {
  * orphaned segment, a full Apply moved it from 0.6077 to 0.6674 at the midpoint when the
  * handles alone called for 0.1046.
  *
- * The fields cannot be written away (modifyKeyframe throws on rightSpeed / rightInfluence)
- * and cannot be neutralised (speed 1 is simply another speed, not an off switch). Deleting
- * and recreating the keyframe is the only thing that clears them.
+ * The fields cannot be written away through the keyframe APIs (modifyKeyframe throws on
+ * rightSpeed / rightInfluence) and cannot be neutralised (speed 1 is simply another speed, not
+ * an off switch; setKeyframeVelocity ignores null and undefined, and clamps -1 to 0.01).
+ *
+ * There IS one route that clears them without deleting anything, undocumented but sound — the
+ * scripting equivalent of the keyframe's right-click > Linear:
+ *
+ *     api.set(keyframeId, { data: { interpolation, numValue, leftBez, rightBez,
+ *                                   locked, weightLocked } });
+ *
+ * The keyframe's `data` blob accepts a write with the speed fields simply LEFT OUT, and they
+ * are gone afterwards — verified against a live scene, after which handle easing rendered the
+ * requested curve to rms 0.0000 again. Note `getAttributes(keyframeId)` reports only ["id"],
+ * so `data` does not announce itself as writable; and the write replaces the blob wholesale,
+ * so every key above has to be carried over or it is silently dropped. Dropping just one
+ * side's pair works too, which matters because the fields are per side: a segment is governed
+ * by its start key's right pair and its end key's left pair, and only a segment with NO fields
+ * on either side is driven by its handles.
+ *
+ * This function keeps the delete-and-recreate below because it is the measured, working path
+ * and rewriting it buys nothing today. The data write is the lighter option if this ever needs
+ * revisiting — or if straight motion-path segments should go back to tangent easing, which
+ * keeps them in exact lockstep with single-channel attributes.
  *
  * That deletion makes Cavalry re-derive the surviving neighbours' tangents, which wrecks the
  * segments either side: measured, the trailing neighbour went from 0.3274 to 0.0659 at its
