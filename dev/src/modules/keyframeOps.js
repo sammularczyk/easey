@@ -16,6 +16,7 @@ var IDENTICAL_VALUE_EPSILON = 0.001;
 var UNLOCKED_TANGENT = { angleLocked: false, weightLocked: false };
 
 var _clampHoldsEnabled = true;
+var _warnPathDesyncEnabled = true;
 
 // Measured: 10 is the floor. Accuracy is flat from 60 samples down to 10 (a 600px move fits
 // to within 0.6px either way) and falls off a cliff at 8. Scrubbing is nearly free — 61
@@ -40,6 +41,13 @@ var VELOCITY_FIT_CACHE_MAX = 64;
  */
 export function setClampHoldsEnabled(enabled) {
     _clampHoldsEnabled = enabled;
+}
+
+/**
+ * Set whether the motion path desync warning shows a modal (called from Easey.js).
+ */
+export function setWarnPathDesyncEnabled(enabled) {
+    _warnPathDesyncEnabled = enabled;
 }
 
 function valuesAreIdentical(a, b) {
@@ -199,6 +207,32 @@ function buildAttributeGroups(selectedKeyframes) {
         }
     }
     return attributeGroups;
+}
+
+/**
+ * Layers in the selection that have position.x or position.y keys selected.
+ *
+ * A Cavalry motion path is x/y only, but selecting Position in the timeline also grabs
+ * position.z, and 2D-authored imports often leave a keyed z behind. Read as a third axis it
+ * breaks path detection and skews the averaged easing, so z is ignored whenever x or y is
+ * selected on the same layer. Select z on its own to ease it as an ordinary channel.
+ *
+ * @param {Object} selectedKeyframes - api.getSelectedKeyframes() result
+ * @returns {Set<string>} layer ids
+ */
+export function layersWithSelectedPathAxis(selectedKeyframes) {
+    var layers = new Set();
+    for (let fullAttributePath of Object.keys(selectedKeyframes)) {
+        var hashIndex = fullAttributePath.indexOf('#');
+        if (hashIndex === -1) continue;
+        var dotAfterHash = fullAttributePath.indexOf('.', hashIndex);
+        if (dotAfterHash === -1) continue;
+        var attrId = fullAttributePath.substring(dotAfterHash + 1);
+        if (attrId === 'position.x' || attrId === 'position.y') {
+            layers.add(fullAttributePath.substring(0, dotAfterHash));
+        }
+    }
+    return layers;
 }
 
 /**
@@ -967,16 +1001,21 @@ function motionPathChannelsDisagree(layerId, attrId, frameA, frameB) {
  * Falls through to a log if no modal is available, rather than silently blocking an Apply.
  */
 function confirmMotionPathDesync(segments) {
+    if (!_warnPathDesyncEnabled) {
+        console.warn('Motion path distorted — position.x/y keyed differently at: ' + segments.join(', '));
+        return true;
+    }
     var body =
         'position.x and position.y are keyed at different frames across ' +
         (segments.length === 1 ? 'this segment:' : 'these segments:') + '\n\n' +
         segments.join('\n') + '\n\n' +
         'Both channels must share one timing for the path to hold its shape, so easing this ' +
-        'will change where the layer travels, not just how fast.\n\nApply anyway?';
+        'will change where the layer travels, not just how fast.\n\n' +
+        'Disable this warning in Easey settings > Warn when breaking motion paths.\n\nApply anyway?';
     try {
         return new ui.Modal().showConfirmation('Motion path will be distorted', body);
     } catch (e) {
-        console.log('Motion path channels disagree at: ' + segments.join(', '));
+        console.warn('Motion path channels disagree at: ' + segments.join(', '));
         return true;
     }
 }
@@ -1635,16 +1674,22 @@ export function readNeighbourSegments() {
         // A motion path selects position.x and position.y together and they share one clock,
         // so that pair is still one segment. Any other multi-attribute selection is not.
         var candidates = [];
+        var pathAxisLayers = layersWithSelectedPathAxis(selectedKeyframes);
         for (let [fullAttributePath, frames] of Object.entries(selectedKeyframes)) {
             if (!frames || frames.length === 0) continue;
-            if (frames.length !== 2) return null;
 
             var dotAfterHash = fullAttributePath.indexOf('.', fullAttributePath.indexOf('#'));
             if (fullAttributePath.indexOf('#') === -1 || dotAfterHash === -1) return null;
 
+            var candidateLayerId = fullAttributePath.substring(0, dotAfterHash);
+            var candidateAttrId = fullAttributePath.substring(dotAfterHash + 1);
+            if (candidateAttrId === 'position.z' && pathAxisLayers.has(candidateLayerId)) continue;
+
+            if (frames.length !== 2) return null;
+
             candidates.push({
-                layerId: fullAttributePath.substring(0, dotAfterHash),
-                attrId: fullAttributePath.substring(dotAfterHash + 1),
+                layerId: candidateLayerId,
+                attrId: candidateAttrId,
                 frames: frames.slice().sort(function (a, b) { return a - b; })
             });
         }
@@ -1790,9 +1835,12 @@ export function getEasingFromKeyframes(currentEasing) {
         // A motion path's two axes carry identical velocity, so reading both would count the
         // same segment twice and report a bogus "averaged from 2 pairs".
         var seenPathSegments = new Set();
+        var pathAxisLayers = layersWithSelectedPathAxis(selectedKeyframes);
 
         try {
             for (let [attributePath, group] of Object.entries(attributeGroups)) {
+                if (group.attrId === 'position.z' && pathAxisLayers.has(group.layerId)) continue;
+
                 for (var i = 0; i < group.keyframeIds.length - 1; i++) {
                     var currentKeyId = group.keyframeIds[i];
                     var nextKeyId = group.keyframeIds[i + 1];

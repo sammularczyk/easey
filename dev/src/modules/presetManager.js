@@ -400,6 +400,7 @@ function makeSetting(key, defaultValue, validate, label) {
 var applyOnDragSetting = makeSetting("easey_applyOnDrag", false, isDefined, "apply on drag setting");
 var updateCheckSetting = makeSetting("easey_checkForUpdates", true, isDefined, "update check setting");
 var clampIdenticalSetting = makeSetting("easey_clampIdenticalValues", true, isDefined, "clamp identical setting");
+var warnPathDesyncSetting = makeSetting("easey_warnPathDesync", true, isDefined, "warn path desync setting");
 var presetLayoutSetting = makeSetting("easey_presetLayout", "list", function(saved) {
     return saved === "list" || saved === "grid";
 }, "preset layout setting");
@@ -454,6 +455,22 @@ export function saveClampIdenticalSetting(enabled) {
  */
 export function loadClampIdenticalSetting() {
     return clampIdenticalSetting.load();
+}
+
+/**
+ * Save whether to warn before breaking motion paths
+ * @param {boolean} enabled
+ */
+export function saveWarnPathDesyncSetting(enabled) {
+    return warnPathDesyncSetting.save(enabled);
+}
+
+/**
+ * Load whether to warn before breaking motion paths
+ * @returns {boolean} (default: true)
+ */
+export function loadWarnPathDesyncSetting() {
+    return warnPathDesyncSetting.load();
 }
 
 /**

@@ -10,6 +10,7 @@ import {
     sampleVelocityCurve,
     sampleVelocityCurveWithMax
 } from "../src/modules/conversions.js";
+import { layersWithSelectedPathAxis } from "../src/modules/keyframeOps.js";
 
 const near = (a, b, msg) => assert.ok(Math.abs(a - b) < 1e-9, `${msg}: ${a} vs ${b}`);
 
@@ -94,6 +95,32 @@ const sel = { frameDiff: 20, valueDiff: 100 };
     assert.ok(withMax.max > 0, "a peak is reported");
     // The samples are the speeds divided by that peak, so the peak sample must be exactly 1.
     near(Math.max(...plain), 1, "normalised samples still peak at 1");
+}
+
+// Selecting Position in the timeline grabs position.z too, and 2D-authored imports often
+// leave a keyed z behind. Read as a third axis it stops x+y counting as one path segment, so
+// the ghosts vanish and the averaged easing is polluted by a channel nobody is looking at.
+{
+    const layer = "group#215";
+    const both = layersWithSelectedPathAxis({
+        [`${layer}.position.x`]: [0, 42],
+        [`${layer}.position.y`]: [0, 42],
+        [`${layer}.position.z`]: [0, 42]
+    });
+    assert.ok(both.has(layer), "a layer with x and y selected is a path layer, so its z is ignorable");
+
+    // z on its own is still an ordinary channel and must keep working.
+    const zOnly = layersWithSelectedPathAxis({ [`${layer}.position.z`]: [0, 42] });
+    assert.equal(zOnly.size, 0, "z alone flags no path layer");
+
+    // Another layer's x must not license ignoring this layer's z.
+    const other = layersWithSelectedPathAxis({
+        "group#209.position.x": [0, 42],
+        [`${layer}.position.z`]: [0, 42]
+    });
+    assert.ok(!other.has(layer), "the exclusion is per layer");
+
+    assert.equal(layersWithSelectedPathAxis({ "scale.x": [0, 42] }).size, 0, "a path with no layer id is skipped");
 }
 
 console.log("neighbours.test.mjs: ok");

@@ -63,13 +63,14 @@ import { checkForUpdate } from './modules/updateChecker.js';
 import { getCompositionFrameRate } from './modules/conversions.js';
 import { drawCurve, drawSpeedCurve } from './modules/graphRenderer.js';
 import { setupValueGraphHandlers, setupSpeedGraphHandlers } from './modules/mouseHandlers.js';
-import { getEasingFromKeyframes, applyEasingToKeyframes, fixHoldPaths, setClampHoldsEnabled, copyKeyframeDuration, copyKeyframeValues, copyAllKeyframeInfo, readNeighbourSegments } from './modules/keyframeOps.js';
+import { getEasingFromKeyframes, applyEasingToKeyframes, fixHoldPaths, setClampHoldsEnabled, setWarnPathDesyncEnabled, copyKeyframeDuration, copyKeyframeValues, copyAllKeyframeInfo, readNeighbourSegments } from './modules/keyframeOps.js';
 import {
     loadLibraries, saveLibraries, createLibrary, renameLibrary, deleteLibrary,
     exportLibrary, importLibrary, savePresetToLibrary, renameLibraryPreset,
     deleteLibraryPreset, movePresetToLibrary, movePreset,
     saveApplyOnDragSetting, loadApplyOnDragSetting,
     saveClampIdenticalSetting, loadClampIdenticalSetting,
+    saveWarnPathDesyncSetting, loadWarnPathDesyncSetting,
     saveUpdateCheckSetting, loadUpdateCheckSetting,
     saveLastSelectedTab, loadLastSelectedTab,
     savePresetLayoutSetting, loadPresetLayoutSetting,
@@ -181,6 +182,7 @@ var updateCheckEnabled = loadUpdateCheckSetting();
 var presetLayout = "list";
 var applyOnDragEnabled = false;
 var clampHoldsEnabled = true;
+var warnPathDesyncEnabled = true;
 
 // Flags
 var isUpdatingFromPreset = false;
@@ -704,6 +706,15 @@ function showPresetContextMenu() {
     });
 
     ui.addMenuItem({
+        name: "Warn when breaking motion paths" + (warnPathDesyncEnabled ? " ✓" : ""),
+        onMouseRelease: function() {
+            warnPathDesyncEnabled = !warnPathDesyncEnabled;
+            setWarnPathDesyncEnabled(warnPathDesyncEnabled);
+            saveWarnPathDesyncSetting(warnPathDesyncEnabled);
+        }
+    });
+
+    ui.addMenuItem({
         name: "Check for updates automatically" + (updateCheckEnabled ? " ✓" : ""),
         onMouseRelease: function() {
             updateCheckEnabled = !updateCheckEnabled;
@@ -803,6 +814,9 @@ applyOnDragEnabled = loadApplyOnDragSetting();
 // Load clamp holds setting
 clampHoldsEnabled = loadClampIdenticalSetting();
 setClampHoldsEnabled(clampHoldsEnabled);
+
+warnPathDesyncEnabled = loadWarnPathDesyncSetting();
+setWarnPathDesyncEnabled(warnPathDesyncEnabled);
 
 // ============================================================================
 // UI LAYOUT
