@@ -1,4 +1,4 @@
-<img width="640" height="320" alt="Easey" src="https://github.com/user-attachments/assets/61a05741-0a90-429f-90dc-9435a7fbf098" />
+<img width="640" height="320" alt="Easey" src="https://github.com/user-attachments/assets/824dde15-28ab-40d6-af6b-f514e36377a5" />
 
 ### Open source speed and value graph for Cavalry
 
@@ -8,11 +8,11 @@
   </a>
 </p>
 
-Adds a speed graph, simple value graph and allows cubic-bezier notation for easing between two keyframes. Makes easing easy. 
+Adds a speed graph, value graph and allows cubic-bezier notation for easing between two keyframes. Makes easing easy. 
 
-You can also save presets, and copy duration and easing values to pass to developers.
+You can also save and export presets, and copy duration and easing values to pass to developers.
 
-If you're looking for a more polished value graph editor that supports Magic Easing, check out [Curves at Scenery.io](https://scenery.io/scripts/curves-42xvUYqCpvY).
+Easey simplifies working with motion paths, giving you the tools you need to craft motion quickly and easily.
 
 > [!TIP]
 > Hold CTRL/CMD while dragging handles to mirror them in the Speed graph.
@@ -23,4 +23,4 @@ If you're looking for a more polished value graph editor that supports Magic Eas
 
 This script is owned and made possible by the [Canva Creative Team](https://canvacreative.team/motion). Check out more scripts, including Quiver, at their website.
 
-Created with the assistance of Cursor and [scenery-io/create-script](https://github.com/scenery-io/create-script).
+Created with the assistance of Claude and [scenery-io/create-script](https://github.com/scenery-io/create-script).
